@@ -1,0 +1,19 @@
+[package]
+name = "duct"
+version = "0.1.0"
+edition = "2024"
+
+[lib]
+name = "duct"
+path = "src/lib.rs"
+
+[[bin]]
+name = "duct"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread"] }
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+anyhow = "1"

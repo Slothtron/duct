@@ -2,9 +2,7 @@ use clap::Parser;
 use std::env;
 use std::os::unix::process::CommandExt;
 
-/// Process names that are typically exempt from argv[0]-based filtering.
-/// When disguise is enabled, duct re-execs itself with one of these names.
-const ALLOWED_NAMES: &[&str] = &["curl", "wget", "python3", "python", "node", "java", "firefox", "chrome"];
+use duct::auth::AuthConfig;
 
 #[derive(Parser, Debug)]
 #[command(name = "duct", version, about = "Lightweight HTTP/HTTPS proxy with process name disguise")]
@@ -22,40 +20,67 @@ struct Cli {
     verbose: u8,
 
     /// Process name to use when re-execing for argv[0] filtering compatibility.
-    /// Defaults to "curl".
-    #[arg(long, default_value = "curl")]
-    disguise: String,
-
-    /// Skip the process-name disguise re-exec. Use this if your environment
-    /// doesn't filter by argv[0] or you've manually renamed the binary.
+    /// When not provided, no disguise is performed.
     #[arg(long)]
-    no_disguise: bool,
+    disguise: Option<String>,
+
+    /// Username for HTTP Basic proxy authentication.
+    /// Must be used together with --password.
+    #[arg(long)]
+    username: Option<String>,
+
+    /// Password for HTTP Basic proxy authentication.
+    /// Must be used together with --username.
+    #[arg(long)]
+    password: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // ── Process name disguise ──
-    // Some environments filter TCP connections by the originating process name
-    // (argv[0]). If our process name isn't recognized, connections may be
-    // rejected. Solution: re-exec ourselves with argv[0] set to an allowed name.
-    if !cli.no_disguise {
-        let current_name = env::args().next().unwrap_or_default();
-        let basename = current_name.rsplit('/').next().unwrap_or(&current_name);
-
-        if !ALLOWED_NAMES.contains(&basename) {
-            let exe = env::current_exe()?;
-            let disguise = &cli.disguise;
-
-            // Re-exec with argv[0] set to the disguise name
-            let status = std::process::Command::new(&exe)
-                .arg0(disguise)
-                .args(env::args_os().skip(1))
-                .status()?;
-
-            std::process::exit(status.code().unwrap_or(1));
+    // Validate credential pairing
+    let auth = match (&cli.username, &cli.password) {
+        (Some(u), Some(p)) => Some(AuthConfig {
+            username: u.clone(),
+            password: p.clone(),
+        }),
+        (None, None) => None,
+        _ => {
+            eprintln!("error: --username and --password must be used together");
+            std::process::exit(1);
         }
+    };
+
+    // ── Process name disguise (opt-in) ──
+    // Some environments filter TCP connections by the originating process name
+    // (argv[0]). When --disguise is provided, re-exec with argv[0] set to the
+    // specified name.
+    if let Some(ref disguise) = cli.disguise {
+        let exe = env::current_exe()?;
+
+        // Filter out --disguise (and its value) from args to prevent infinite re-exec
+        let filtered_args: Vec<_> = {
+            let mut skip_next = false;
+            env::args_os().skip(1).filter(|a| {
+                if skip_next {
+                    skip_next = false;
+                    return false;
+                }
+                if a == "--disguise" {
+                    skip_next = true;
+                    return false;
+                }
+                true
+            }).collect()
+        };
+
+        tracing::info!(%disguise, "re-execing with disguised process name");
+        let status = std::process::Command::new(&exe)
+            .arg0(disguise)
+            .args(&filtered_args)
+            .status()?;
+        std::process::exit(status.code().unwrap_or(1));
     }
 
     let filter = if cli.verbose > 0 {
@@ -71,7 +96,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let addr = format!("{}:{}", cli.bind, cli.port);
-    tracing::info!(%addr, "starting duct");
+    tracing::info!(%addr, auth = auth.is_some(), "starting duct");
 
-    duct::server::run(&addr).await
+    duct::server::run(&addr, auth).await
 }

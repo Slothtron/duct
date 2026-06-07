@@ -2,6 +2,7 @@ use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
+use crate::auth::{self, AuthConfig};
 use crate::connect;
 
 /// Maximum length of the request line before returning 414.
@@ -11,20 +12,21 @@ const MAX_REQUEST_LINE_BYTES: usize = 8192;
 const MAX_HTTP_REQUEST_BYTES: usize = 65536;
 
 /// Run the duct proxy server, binding to the given address.
-pub async fn run(addr: impl tokio::net::ToSocketAddrs) -> Result<()> {
+pub async fn run(addr: impl tokio::net::ToSocketAddrs, auth: Option<AuthConfig>) -> Result<()> {
     let listener = TcpListener::bind(addr).await?;
-    run_from_listener(listener).await
+    run_from_listener(listener, auth).await
 }
 
 /// Run the duct proxy server from an already-bound listener.
 /// Useful for tests that bind to a random port.
-pub async fn run_from_listener(listener: TcpListener) -> Result<()> {
+pub async fn run_from_listener(listener: TcpListener, auth: Option<AuthConfig>) -> Result<()> {
     tracing::info!("duct listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         tracing::debug!(%peer_addr, "new connection");
+        let auth = auth.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream).await {
+            if let Err(e) = handle_connection(stream, auth.as_ref()).await {
                 tracing::warn!(%peer_addr, error = %e, "connection error");
             }
         });
@@ -111,7 +113,7 @@ async fn read_headers(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8
     Ok(buf)
 }
 
-async fn handle_connection(mut stream: TcpStream) -> Result<()> {
+async fn handle_connection(mut stream: TcpStream, auth: Option<&AuthConfig>) -> Result<()> {
     // Read the request line
     let line = read_line(&mut stream, MAX_REQUEST_LINE_BYTES)
         .await
@@ -138,8 +140,18 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
                 }
             };
 
-            // Consume remaining HTTP headers (they should be empty or ignored)
-            let _ = read_headers(&mut stream, MAX_HTTP_REQUEST_BYTES).await?;
+            // Read headers for potential auth check
+            let headers = read_headers(&mut stream, MAX_HTTP_REQUEST_BYTES).await?;
+
+            // Check authentication if enabled
+            if let Some(auth_config) = auth {
+                if !check_auth(auth_config, &headers) {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"duct\"\r\n\r\n")
+                        .await;
+                    bail!("authentication failed");
+                }
+            }
 
             connect::handle_connect(stream, host, port).await
         }
@@ -158,6 +170,16 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
 
             // Read the headers
             let headers = read_headers(&mut stream, MAX_HTTP_REQUEST_BYTES).await?;
+
+            // Check authentication if enabled
+            if let Some(auth_config) = auth {
+                if !check_auth(auth_config, &headers) {
+                    let _ = stream
+                        .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"duct\"\r\n\r\n")
+                        .await;
+                    bail!("authentication failed");
+                }
+            }
 
             // Build the full request to forward (rewrite request line to relative URL)
             let request_line = rebuild_request_line(&line, host, port)?;
@@ -217,6 +239,26 @@ async fn handle_connection(mut stream: TcpStream) -> Result<()> {
             }
         }
     }
+}
+
+/// Check authentication against raw HTTP headers.
+/// Returns true if auth passes or if not required.
+fn check_auth(config: &AuthConfig, headers: &[u8]) -> bool {
+    // Look for Proxy-Authorization header in raw bytes (case-insensitive)
+    let header_str = String::from_utf8_lossy(headers);
+
+    for line in header_str.lines() {
+        let line_lower = line.to_lowercase();
+        if line_lower.starts_with("proxy-authorization:") {
+            if let Some(value) = line.splitn(2, ':').nth(1) {
+                if let Some((user, pass)) = auth::parse_proxy_authorization(value.trim()) {
+                    return auth::check(config, &user, &pass);
+                }
+            }
+        }
+    }
+
+    false
 }
 
 /// Rebuild the request line from an absolute URL to a relative one.

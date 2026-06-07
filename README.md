@@ -6,7 +6,8 @@
 
 - **HTTP CONNECT 隧道代理**：支持 HTTPS 流量的透明转发
 - **HTTP 正向代理**：支持浏览器插件模式（如 SwitchyOmega）的 HTTP 请求转发
-- **进程名伪装**：自动检测进程名并 re-exec 为允许的名称（如 `curl`），绕过基于 argv[0] 的访问控制
+- **HTTP Basic 认证**：支持通过 `--username` / `--password` 保护代理访问
+- **进程名伪装**：通过 `--disguise` 指定进程名，绕过基于 argv[0] 的访问控制
 - **高性能**：基于 Rust + tokio 异步运行时，单二进制部署
 - **完整测试覆盖**：16 个单元测试 + 10 个集成测试
 
@@ -34,20 +35,30 @@ duct -v
 
 ### 进程名伪装
 
-某些环境会基于发起连接的**进程名（argv[0]）**进行访问控制。duct 通过 re-exec 自身并伪装进程名来绕过这一限制。
-
-默认自动伪装为 `curl`：
+某些环境会基于发起连接的**进程名（argv[0]）**进行访问控制。通过 `--disguise` 参数，duct 可以 re-exec 自身并伪装为指定进程名。
 
 ```bash
-# 自动伪装为 curl（默认）
-duct
+# 启用伪装，指定进程名
+duct --disguise curl
 
-# 指定伪装名称
+# 指定其他名称
 duct --disguise wget
-
-# 禁用伪装（已手动重命名二进制时使用）
-duct --no-disguise
 ```
+
+### HTTP Basic 认证
+
+```bash
+# 启用认证（每个请求需提供用户名/密码）
+duct --username alice --password p@ss123
+
+# 配合认证使用 curl
+curl -x http://alice:p@ss123@127.0.0.1:10999 https://httpbin.org/get
+
+# 或通过 --proxy-user 参数
+curl -x http://127.0.0.1:10999 --proxy-user alice:p@ss123 https://httpbin.org/get
+```
+
+> **注意**: `--username` 和 `--password` 必须同时使用。未提供时认证默认关闭。
 
 ### 配置浏览器代理
 
@@ -73,8 +84,9 @@ curl -x http://127.0.0.1:10999 http://httpbin.org/get
 ```
 src/
 ├── main.rs      # CLI 入口 + 进程名伪装 + tracing 配置
-├── server.rs    # TCP 接收循环 + CONNECT/HTTP 请求分发
+├── server.rs    # TCP 接收循环 + CONNECT/HTTP 请求分发 + 认证检查
 ├── connect.rs   # CONNECT 隧道逻辑 + 请求解析 + HTTP 转发
+├── auth.rs      # HTTP Basic 认证检查 + base64 解码
 └── lib.rs       # 模块导出
 ```
 
@@ -114,8 +126,9 @@ Options:
   -v, --verbose             启用 debug 级别日志
   -V, --version             版本信息
   -h, --help                帮助信息
-      --disguise <NAME>     进程伪装名称 [default: curl]
-      --no-disguise         禁用进程名伪装
+      --disguise <NAME>     进程伪装名称（可选，默认不启用）
+      --username <USER>     HTTP Basic 认证用户名
+      --password <PASS>     HTTP Basic 认证密码
 ```
 
 ## 开发
@@ -160,6 +173,16 @@ RUST_LOG=debug duct -v
 
 **解决：** duct 已支持 HTTP 正向代理，请确认使用最新版本
 
+### 问题：认证失败
+
+**症状：** 收到 `407 Proxy Authentication Required` 错误
+
+**解决：**
+```bash
+# 提供正确的凭据
+curl -x http://alice:p@ss123@127.0.0.1:10999 https://httpbin.org/get
+```
+
 ### 问题：连接被拒绝或立即关闭
 
 **症状：** 连接建立后立即被关闭
@@ -168,10 +191,10 @@ RUST_LOG=debug duct -v
 
 **解决：**
 ```bash
-# 确认伪装已启用
+# 启用进程名伪装
 duct --disguise curl
 
-# 或检查当前进程名是否为允许列表中的名称
+# 或检查当前进程名
 ps aux | grep duct
 ```
 
@@ -179,9 +202,7 @@ ps aux | grep duct
 
 ### 为什么需要进程名伪装？
 
-某些安全软件或 VPN 客户端会在内核层面拦截 TCP 连接，检查发起连接的进程名。非允许名单中的进程的连接可能被关闭。
-
-**验证原理：** duct 启动时读取当前进程名（argv[0]），如果不在内置的允许列表中，就使用 `CommandExt::arg0()` 以允许的名称（默认 `curl`）重新执行自身。
+某些安全软件或 VPN 客户端会在内核层面拦截 TCP 连接，检查发起连接的进程名。非允许名单中的进程的连接可能被关闭。 duct 通过 `--disguise <name>` 使用 `CommandExt::arg0()` 重新执行自身来绕过这一限制。
 
 ### CONNECT 隧道
 

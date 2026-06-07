@@ -156,7 +156,6 @@ pub async fn handle_connect(mut client: TcpStream, host: &str, port: u16) -> Res
 }
 
 /// ── Tests for parse_connect_request ──────────────────────────
-
 #[cfg(test)]
 mod handle_connect_tests {
     use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};

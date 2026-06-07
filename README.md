@@ -6,10 +6,10 @@
 
 - **HTTP CONNECT 隧道代理**：支持 HTTPS 流量的透明转发
 - **HTTP 正向代理**：支持浏览器插件模式（如 SwitchyOmega）的 HTTP 请求转发
-- **HTTP Basic 认证**：支持通过 `--username` / `--password` 保护代理访问
+- **HTTP Basic 认证**：支持通过 `--user` / `--passwd` CLI 参数或 `DUCT_USER` / `DUCT_PASSWD` 环境变量保护代理访问
 - **进程名伪装**：通过 `--disguise` 指定进程名，绕过基于 argv[0] 的访问控制
 - **高性能**：基于 Rust + tokio 异步运行时，单二进制部署
-- **完整测试覆盖**：16 个单元测试 + 10 个集成测试
+- **完整测试覆盖**：27 个单元测试 + 15 个集成测试
 
 ## 安装
 
@@ -48,8 +48,11 @@ duct --disguise wget
 ### HTTP Basic 认证
 
 ```bash
-# 启用认证（每个请求需提供用户名/密码）
-duct --username alice --password p@ss123
+# 方式 1：CLI 参数（本地测试用）
+duct --user alice --passwd p@ss123
+
+# 方式 2：环境变量（推荐 systemd 部署，ps 不可见）
+DUCT_USER=alice DUCT_PASSWD=p@ss123 duct
 
 # 配合认证使用 curl
 curl -x http://alice:p@ss123@127.0.0.1:10999 https://httpbin.org/get
@@ -58,7 +61,7 @@ curl -x http://alice:p@ss123@127.0.0.1:10999 https://httpbin.org/get
 curl -x http://127.0.0.1:10999 --proxy-user alice:p@ss123 https://httpbin.org/get
 ```
 
-> **注意**: `--username` 和 `--password` 必须同时使用。未提供时认证默认关闭。
+> **注意**: `--user` 和 `--passwd` 必须同时使用。未提供时认证默认关闭。
 
 ### 配置浏览器代理
 
@@ -127,8 +130,8 @@ Options:
   -V, --version             版本信息
   -h, --help                帮助信息
       --disguise <NAME>     进程伪装名称（可选，默认不启用）
-      --username <USER>     HTTP Basic 认证用户名
-      --password <PASS>     HTTP Basic 认证密码
+      --user <USER>       HTTP Basic 认证用户名（也支持 DUCT_USER 环境变量）
+      --passwd <PASS>     HTTP Basic 认证密码（也支持 DUCT_PASSWD 环境变量）
 ```
 
 ## 开发

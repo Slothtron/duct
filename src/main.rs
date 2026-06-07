@@ -8,7 +8,7 @@ use duct::auth::AuthConfig;
 #[command(name = "duct", version, about = "Lightweight HTTP/HTTPS proxy with process name disguise")]
 struct Cli {
     /// Listening port
-    #[arg(short, long, default_value_t = 1080)]
+    #[arg(short, long, default_value_t = 10999)]
     port: u16,
 
     /// Listening address

@@ -25,32 +25,32 @@ struct Cli {
     disguise: Option<String>,
 
     /// Username for HTTP Basic proxy authentication.
-    /// Must be used together with --password.
-    #[arg(long)]
-    username: Option<String>,
+    /// Can also be set via DUCT_USER environment variable.
+    /// Must be used together with --passwd.
+    #[arg(long, env = "DUCT_USER", requires = "passwd")]
+    user: Option<String>,
 
     /// Password for HTTP Basic proxy authentication.
-    /// Must be used together with --username.
-    #[arg(long)]
-    password: Option<String>,
+    /// Can also be set via DUCT_PASSWD environment variable.
+    /// Must be used together with --user.
+    #[arg(long, env = "DUCT_PASSWD", requires = "user")]
+    passwd: Option<String>,
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // Validate credential pairing
-    let auth = match (&cli.username, &cli.password) {
-        (Some(u), Some(p)) => Some(AuthConfig {
-            username: u.clone(),
-            password: p.clone(),
-        }),
-        (None, None) => None,
-        _ => {
-            eprintln!("error: --username and --password must be used together");
-            std::process::exit(1);
-        }
-    };
+    // Construct auth config from CLI args or environment variables.
+    // clap's `requires` ensures both --user and --passwd (or their env counterparts)
+    // are provided together, or neither is provided.
+    let auth = cli
+        .user
+        .zip(cli.passwd)
+        .map(|(user, passwd)| AuthConfig {
+            username: user,
+            password: passwd,
+        });
 
     // ── Process name disguise (opt-in) ──
     // Some environments filter TCP connections by the originating process name

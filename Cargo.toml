@@ -12,7 +12,7 @@ name = "duct"
 path = "src/main.rs"
 
 [dependencies]
-tokio = { version = "1", features = ["net", "io-util", "macros", "rt-multi-thread"] }
+tokio = { version = "1", features = ["net", "io-util", "time", "macros", "rt-multi-thread"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }

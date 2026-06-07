@@ -1,24 +1,14 @@
 # duct
 
-轻量级 HTTP 代理，专为 WSL2 环境下的 VPN 隧道访问设计。
+轻量级 HTTP/HTTPS 代理服务，支持 CONNECT 隧道和 HTTP 正向代理。
 
 ## 功能特性
 
 - **HTTP CONNECT 隧道代理**：支持 HTTPS 流量的透明转发
 - **HTTP 正向代理**：支持浏览器插件模式（如 SwitchyOmega）的 HTTP 请求转发
-- **VPN 进程名伪装**：自动规避 yunshu VPN 的进程名过滤机制
+- **进程名伪装**：自动检测进程名并 re-exec 为允许的名称（如 `curl`），绕过基于 argv[0] 的访问控制
 - **高性能**：基于 Rust + tokio 异步运行时，单二进制部署
-- **完整测试覆盖**：16 个单元测试 + 4 个集成测试
-
-## 背景
-
-yunshu VPN 守护进程基于**进程名（argv[0]）**过滤 TCP 连接，只有白名单中的进程才能访问内网地址。duct 通过 re-exec 自身并伪装进程名，绕过这一限制。
-
-**白名单验证结果：**
-
-| ✅ 允许 | ❌ 阻止 |
-|---------|--------|
-| curl, wget, python3, python, node, java, firefox, chrome | duct, ssh, socat, nc, bash, sh |
+- **完整测试覆盖**：16 个单元测试 + 10 个集成测试
 
 ## 安装
 
@@ -42,9 +32,11 @@ duct -p 8080
 duct -v
 ```
 
-### VPN 进程名伪装
+### 进程名伪装
 
-默认自动伪装为 `curl`（白名单中的进程名）：
+某些环境会基于发起连接的**进程名（argv[0]）**进行访问控制。duct 通过 re-exec 自身并伪装进程名来绕过这一限制。
+
+默认自动伪装为 `curl`：
 
 ```bash
 # 自动伪装为 curl（默认）
@@ -53,7 +45,7 @@ duct
 # 指定伪装名称
 duct --disguise wget
 
-# 禁用伪装（手动 symlink 时使用）
+# 禁用伪装（已手动重命名二进制时使用）
 duct --no-disguise
 ```
 
@@ -74,9 +66,6 @@ curl -x http://127.0.0.1:10999 https://httpbin.org/get
 
 # HTTP 正向代理
 curl -x http://127.0.0.1:10999 http://httpbin.org/get
-
-# 访问内网域名
-curl -x http://127.0.0.1:10999 https://dmc.kso.net/
 ```
 
 ## 架构
@@ -84,47 +73,18 @@ curl -x http://127.0.0.1:10999 https://dmc.kso.net/
 ```
 src/
 ├── main.rs      # CLI 入口 + 进程名伪装 + tracing 配置
-├── server.rs    # TCP 接收循环 + HTTP 转发代理
-├── connect.rs   # CONNECT 隧道逻辑 + 请求解析
+├── server.rs    # TCP 接收循环 + CONNECT/HTTP 请求分发
+├── connect.rs   # CONNECT 隧道逻辑 + 请求解析 + HTTP 转发
 └── lib.rs       # 模块导出
 ```
 
-### 核心组件
-
-**1. CONNECT 隧道 (`connect.rs`)**
-- 解析 `CONNECT host:port HTTP/1.1` 请求
-- 建立上游连接（10s 超时）
-- 发送 `200 Connection Established`
-- 使用 `copy_bidirectional` 双向转发数据
-
-**2. HTTP 转发代理 (`server.rs`)**
-- 解析绝对 URL 形式的 HTTP 请求（如 `GET http://host/path`）
-- 重写请求行为相对路径（`GET /path`）
-- 转发到上游服务器并返回响应
-
-**3. 进程名伪装 (`main.rs`)**
-- 启动时检查 argv[0] 是否在白名单中
-- 若不在，使用 `CommandExt::arg0()` re-exec 自身
-- 伪装为白名单中的进程名（默认 `curl`）
-
-## 技术细节
-
-### 为什么需要进程名伪装？
-
-yunshu VPN 守护进程在内核层面拦截 TCP 连接，检查发起连接的进程名。非白名单进程的连接会在 ~60ms 内被服务器关闭（TCP FIN）。
-
-**验证过程：**
-1. 直接运行 `duct` → 连接被立即关闭
-2. 将 `duct` 重命名为 `curl` → 连接成功
-3. 测试其他白名单名称（wget, python3 等）→ 均成功
-
-### CONNECT 隧道工作原理
+### 核心工作流
 
 ```
-客户端                duct                  上游服务器
+客户端                duct                   上游服务器
   |                    |                        |
-  |-- CONNECT -------->|                        |
-  |                    |-- TCP connect -------->|
+  |── CONNECT -------->|                        |
+  |                    |── TCP connect -------->|
   |                    |<------- 200 OK --------|
   |<-- 200 OK ---------|                        |
   |                    |                        |
@@ -132,16 +92,30 @@ yunshu VPN 守护进程在内核层面拦截 TCP 连接，检查发起连接的�
   |                    |                        |
 ```
 
-### HTTP 正向代理工作原理
-
 ```
-客户端                duct                  上游服务器
+客户端                duct                   上游服务器
   |                    |                        |
-  |-- GET http://host->|                        |
-  |                    |-- TCP connect -------->|
-  |                    |-- GET /path ---------->|
+  |── GET http://host  |                        |
+  |       /path ------->                        |
+  |                    |── TCP connect -------->|
+  |                    |── GET /path ---------->|
   |                    |<------- 响应 ----------|
   |<------ 响应 --------|                        |
+```
+
+### 配置选项
+
+```
+duct [OPTIONS]
+
+Options:
+  -p, --port <PORT>         监听端口 [default: 10999]
+  -b, --bind <ADDR>         监听地址 [default: 0.0.0.0]
+  -v, --verbose             启用 debug 级别日志
+  -V, --version             版本信息
+  -h, --help                帮助信息
+      --disguise <NAME>     进程伪装名称 [default: curl]
+      --no-disguise         禁用进程名伪装
 ```
 
 ## 开发
@@ -167,29 +141,6 @@ RUST_LOG=debug duct -v
 
 ## 故障排查
 
-### 问题：内网域名无法访问
-
-**症状：** 连接立即关闭，curl 返回 `Failed to connect`
-
-**原因：** 进程名不在 VPN 白名单中
-
-**解决：**
-```bash
-# 确认伪装已启用
-duct --disguise curl
-
-# 或检查当前进程名
-ps aux | grep duct
-```
-
-### 问题：浏览器插件报 `expected CONNECT method`
-
-**症状：** SwitchyOmega 等插件无法正常工作
-
-**原因：** 插件发送 HTTP 正向代理请求（`GET http://host/path`），而非 CONNECT 隧道
-
-**解决：** 已在 Task 6 中实现 HTTP 正向代理支持，升级到最新版本即可
-
 ### 问题：上游连接超时
 
 **症状：** 日志显示 `upstream connection timed out after 10s`
@@ -197,9 +148,53 @@ ps aux | grep duct
 **原因：** 上游服务器不可达或网络问题
 
 **解决：**
-1. 检查 VPN 连接状态
+1. 检查网络连接状态
 2. 确认上游地址和端口正确
 3. 尝试直接 curl 上游地址（不通过代理）
+
+### 问题：浏览器插件报 `expected CONNECT method`
+
+**症状：** SwitchyOmega 等插件无法正常工作
+
+**原因：** 插件发送 HTTP 正向代理请求（`GET http://host/path`），而非 CONNECT 隧道
+
+**解决：** duct 已支持 HTTP 正向代理，请确认使用最新版本
+
+### 问题：连接被拒绝或立即关闭
+
+**症状：** 连接建立后立即被关闭
+
+**原因：** 某些环境会基于进程名对 TCP 连接做访问控制
+
+**解决：**
+```bash
+# 确认伪装已启用
+duct --disguise curl
+
+# 或检查当前进程名是否为允许列表中的名称
+ps aux | grep duct
+```
+
+## 技术细节
+
+### 为什么需要进程名伪装？
+
+某些安全软件或 VPN 客户端会在内核层面拦截 TCP 连接，检查发起连接的进程名。非允许名单中的进程的连接可能被关闭。
+
+**验证原理：** duct 启动时读取当前进程名（argv[0]），如果不在内置的允许列表中，就使用 `CommandExt::arg0()` 以允许的名称（默认 `curl`）重新执行自身。
+
+### CONNECT 隧道
+
+- 解析 `CONNECT host:port HTTP/1.1` 请求
+- 建立上游连接（10s 超时）
+- 发送 `200 Connection Established`
+- 使用 `copy_bidirectional` 双向转发数据
+
+### HTTP 正向代理
+
+- 解析绝对 URL 形式的 HTTP 请求（如 `GET http://host/path`）
+- 重写请求行为相对路径（`GET /path`）
+- 转发到上游服务器并返回响应
 
 ## 许可证
 
@@ -207,6 +202,5 @@ MIT
 
 ## 相关资源
 
-- [实现计划文档](docs/plans/2026-06-06-duct-implementation-plan.md)
 - [HTTP CONNECT 方法 (RFC 7231)](https://tools.ietf.org/html/rfc7231#section-4.3.6)
 - [tokio 异步运行时](https://tokio.rs/)

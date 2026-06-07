@@ -2,11 +2,12 @@ use clap::Parser;
 use std::env;
 use std::os::unix::process::CommandExt;
 
-/// Process names that yunshu VPN whitelists for internal network access.
-const VPN_WHITELIST: &[&str] = &["curl", "wget", "python3", "python", "node", "java", "firefox", "chrome"];
+/// Process names that are typically exempt from argv[0]-based filtering.
+/// When disguise is enabled, duct re-execs itself with one of these names.
+const ALLOWED_NAMES: &[&str] = &["curl", "wget", "python3", "python", "node", "java", "firefox", "chrome"];
 
 #[derive(Parser, Debug)]
-#[command(name = "duct", version, about = "HTTP CONNECT proxy for WSL VPN bridge")]
+#[command(name = "duct", version, about = "Lightweight HTTP/HTTPS proxy with process name disguise")]
 struct Cli {
     /// Listening port
     #[arg(short, long, default_value_t = 1080)]
@@ -20,13 +21,13 @@ struct Cli {
     #[arg(short, long, action = clap::ArgAction::Count)]
     verbose: u8,
 
-    /// Process name to use for VPN compatibility (yunshu whitelists by argv[0]).
+    /// Process name to use when re-execing for argv[0] filtering compatibility.
     /// Defaults to "curl".
     #[arg(long, default_value = "curl")]
     disguise: String,
 
-    /// Skip the VPN process-name disguise re-exec. Use this if you've already
-    /// symlinked/renamed the binary to a whitelisted name.
+    /// Skip the process-name disguise re-exec. Use this if your environment
+    /// doesn't filter by argv[0] or you've manually renamed the binary.
     #[arg(long)]
     no_disguise: bool,
 }
@@ -35,16 +36,15 @@ struct Cli {
 async fn main() -> anyhow::Result<()> {
     let cli = Cli::parse();
 
-    // ── VPN process-name disguise ──
-    // yunshu VPN daemon filters TCP connections by the originating process name
-    // (argv[0]). If our process name isn't on the whitelist, connections to
-    // internal hosts (e.g. dmc.kso.net) get RST'd within ~60ms.
-    // Solution: re-exec ourselves with argv[0] set to a whitelisted name.
+    // ── Process name disguise ──
+    // Some environments filter TCP connections by the originating process name
+    // (argv[0]). If our process name isn't recognized, connections may be
+    // rejected. Solution: re-exec ourselves with argv[0] set to an allowed name.
     if !cli.no_disguise {
         let current_name = env::args().next().unwrap_or_default();
         let basename = current_name.rsplit('/').next().unwrap_or(&current_name);
 
-        if !VPN_WHITELIST.contains(&basename) {
+        if !ALLOWED_NAMES.contains(&basename) {
             let exe = env::current_exe()?;
             let disguise = &cli.disguise;
 

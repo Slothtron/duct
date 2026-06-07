@@ -1,9 +1,7 @@
 use anyhow::{bail, Context, Result};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, copy_bidirectional};
-use tokio::net::TcpStream;
-
-/// Parse a CONNECT request line, extracting host and port.
+use tokio::net::TcpStream;/// Parse a CONNECT request line, extracting host and port.
 /// Expected format: `CONNECT host:port HTTP/1.1\r\n`
 pub fn parse_connect_request(line: &str) -> Result<(&str, u16)> {
     let line = line.trim_end_matches('\r').trim_end_matches('\n');
@@ -97,7 +95,7 @@ mod tests {
 }
 
 /// Maximum time to wait for connection to upstream before returning 504.
-const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Handle a CONNECT tunnel: connect to upstream with timeout, send 200, then bidirectional copy.
 /// Drops the connection if any step fails.
@@ -139,7 +137,7 @@ pub async fn handle_connect(mut client: TcpStream, host: &str, port: u16) -> Res
     tracing::info!(%addr, "tunnel established");
 
     match copy_bidirectional(&mut client, &mut upstream).await {
-        Ok((to_client, to_upstream)) => {
+        Ok((to_upstream, to_client)) => {
             tracing::info!(
                 %addr,
                 to_client_bytes = to_client,

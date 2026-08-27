@@ -1,3 +1,4 @@
+use anyhow::Context as _;
 use clap::Parser;
 use std::env;
 use std::os::unix::process::CommandExt;
@@ -8,7 +9,7 @@ use duct::auth::AuthConfig;
 #[command(name = "duct", version, about = "Lightweight HTTP/HTTPS proxy with process name disguise")]
 struct Cli {
     /// Listening port
-    #[arg(short, long, default_value_t = 10999)]
+    #[arg(short, long, default_value_t = 11088)]
     port: u16,
 
     /// Listening address
@@ -35,6 +36,16 @@ struct Cli {
     /// Must be used together with --user.
     #[arg(long, env = "DUCT_PASSWD", requires = "user")]
     passwd: Option<String>,
+
+    /// Path to the aiproxy provider config (YAML).
+    /// When omitted, defaults to ~/.config/duct/config.yaml;
+    /// a missing default file disables the aiproxy feature.
+    #[arg(long)]
+    config_file: Option<String>,
+
+    /// Maximum request body size in bytes forwarded by aiproxy.
+    #[arg(long, default_value_t = 16 * 1024 * 1024)]
+    max_body: usize,
 }
 
 #[tokio::main]
@@ -96,7 +107,40 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let addr = format!("{}:{}", cli.bind, cli.port);
+
+    // ── aiproxy 配置装载（三层语义，§6.2）──
+    let config = match &cli.config_file {
+        Some(path) => {
+            let cfg = duct::config::Config::load_explicit(std::path::Path::new(path))
+                .with_context(|| format!("加载 aiproxy 配置失败: {path}"))?;
+            tracing::info!(
+                providers = cfg.len(),
+                ids = %cfg.provider_ids().join(","),
+                "aiproxy enabled"
+            );
+            cfg
+        }
+        None => match duct::config::Config::load_default()? {
+            Some(cfg) => {
+                tracing::info!(
+                    providers = cfg.len(),
+                    ids = %cfg.provider_ids().join(","),
+                    "aiproxy enabled"
+                );
+                cfg
+            }
+            None => {
+                tracing::info!("aiproxy disabled (no provider config found)");
+                duct::config::Config::default()
+            }
+        },
+    };
+
+    let state = duct::aiproxy::AppState::new(std::sync::Arc::new(config), cli.max_body)
+        .context("构建 aiproxy 状态失败")?;
+
     tracing::info!(%addr, auth = auth.is_some(), "starting duct");
 
-    duct::server::run(&addr, auth).await
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    duct::server::run_with_aiproxy_from_listener(listener, auth, state).await
 }

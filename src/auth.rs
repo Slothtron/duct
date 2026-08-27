@@ -2,7 +2,6 @@
 ///
 /// Provides credential checking and `Proxy-Authorization` header parsing
 /// for HTTP CONNECT and HTTP forward proxy requests.
-
 /// Configuration for proxy authentication.
 #[derive(Debug, Clone)]
 pub struct AuthConfig {
@@ -21,12 +20,9 @@ pub fn parse_proxy_authorization(header_value: &str) -> Option<(String, String)>
     let header_value = header_value.trim();
 
     // Must start with "Basic " (case-insensitive)
-    let encoded = if let Some(rest) = header_value.strip_prefix("Basic ") {
-        rest
-    } else if let Some(rest) = header_value.strip_prefix("basic ") {
-        rest
-    } else {
-        return None;
+    let encoded = match header_value.strip_prefix("Basic ") {
+        Some(rest) => rest,
+        None => header_value.strip_prefix("basic ")?,
     };
 
     let decoded = decode_base64(encoded.trim())?;
@@ -98,7 +94,7 @@ fn decode_base64(input: &str) -> Option<String> {
 
         // Extract 1-3 bytes depending on valid_bits
         for i in 0..valid_bits / 8 {
-            result.push((buf >> (16 - i * 8)) as u8 & 0xFF);
+            result.push((buf >> (16 - i * 8)) as u8);
         }
     }
 

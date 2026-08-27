@@ -52,10 +52,26 @@ Type=simple
 EnvironmentFile=/etc/duct/env
 ExecStart=/usr/local/bin/duct \
     --bind 0.0.0.0 \
-    --port 10999
+    --port 11088
+
+# aiproxy：provider 配置（YAML，仅 id + url 两字段、无密钥）
+# 缺省读 ~/.config/duct/config.yaml；systemd 下 ProtectHome=yes 时 HOME 受限，
+# 显式指定放到 /etc 下更稳妥：
+# ExecStart=/usr/local/bin/duct \
+#     --bind 0.0.0.0 \
+#     --port 11088 \
+#     --config-file /etc/duct/config.yaml
 
 # 注：凭据通过 EnvironmentFile 中的 DUCT_USER / DUCT_PASSWD 传入
 # 不在 argv 中，ps -ef 不可见
+
+# ⚠️ 安全边界声明：aiproxy 分支无鉴权（凭证零接触、不存 Key），
+# 整个服务必须在防火墙后或仅绑定内网地址，严禁直接暴露公网。
+
+# 探活建议（systemd 原生对 Type=simple 无内建 HTTP 探活）：
+#   方式一：cron/timer 定期 `curl -fsS http://127.0.0.1:11088/healthz`
+#   方式二：改用 Type=notify 并配合 sd_notify 或 watchdog 集成
+#   /healthz 与进程 TCP 端口均可用即表示整个 duct 存活
 
 # 安全加固
 NoNewPrivileges=yes
@@ -67,7 +83,7 @@ MemoryDenyWriteExecute=yes
 
 # 进程名伪装（按需启用）
 # 如果环境基于 argv[0] 过滤进程，去掉下面这行的注释：
-# ExecStart=/usr/local/bin/duct --bind 0.0.0.0 --port 10999 --disguise curl
+# ExecStart=/usr/local/bin/duct --bind 0.0.0.0 --port 11088 --disguise curl
 
 [Install]
 WantedBy=multi-user.target
@@ -99,7 +115,7 @@ sudo systemctl status duct
 ### 7. 验证代理功能
 
 ```bash
-curl -x http://proxyuser:change-me-to-a-strong-password@127.0.0.1:10999 https://httpbin.org/get
+curl -x http://proxyuser:change-me-to-a-strong-password@127.0.0.1:11088 https://httpbin.org/get
 ```
 
 ## 日志管理
@@ -146,7 +162,7 @@ sudo systemctl daemon-reload
 sudo systemctl restart duct
 ```
 
-如果端口小于 1024（如 `--port 80` 或 `--port 443`），需要授予 `CAP_NET_BIND_SERVICE` 能力或使用 root。推荐使用大于 1024 的端口（默认 10999）。
+如果端口小于 1024（如 `--port 80` 或 `--port 443`），需要授予 `CAP_NET_BIND_SERVICE` 能力或使用 root。推荐使用大于 1024 的端口（默认 11088）。
 
 ## 进程名伪装
 
@@ -181,7 +197,7 @@ sudo cat /etc/duct/env
 
 ```bash
 # 检查端口占用
-sudo ss -tlnp | grep 10999
+sudo ss -tlnp | grep 11088
 
 # 更换端口后在服务文件中修改 --port 参数
 ```
@@ -193,7 +209,7 @@ sudo ss -tlnp | grep 10999
 sudo systemctl status duct
 
 # 确认防火墙未拦截
-sudo iptables -L -n | grep 10999
+sudo iptables -L -n | grep 11088
 ```
 
 ### 认证失败

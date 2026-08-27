@@ -1,15 +1,18 @@
 # duct
 
-轻量级 HTTP/HTTPS 代理服务，支持 CONNECT 隧道和 HTTP 正向代理。
+轻量级网络中转服务：TCP 级 HTTP/HTTPS 代理（CONNECT 隧道 + 正向代理）与 AI 转发反向代理（`/aiproxy`）共用一个端口。
 
 ## 功能特性
 
 - **HTTP CONNECT 隧道代理**：支持 HTTPS 流量的透明转发
 - **HTTP 正向代理**：支持浏览器插件模式（如 SwitchyOmega）的 HTTP 请求转发
-- **HTTP Basic 认证**：支持通过 `--user` / `--passwd` CLI 参数或 `DUCT_USER` / `DUCT_PASSWD` 环境变量保护代理访问
+- **AI 转发反向代理（aiproxy）**：`/aiproxy/{provider}/*` 按路径前缀转发至预配置上游，YAML 声明式 provider 清单，凭证零接触（不存 Key、不注入 Key），SSE 流式透传
+- **探活端点**：`GET /healthz` 进程级判活，独立于任何配置状态
+- **单端口五路分流**：同一监听端口按请求行形状区分 CONNECT / 正向代理 / aiproxy / healthz
+- **HTTP Basic 认证**：保护 CONNECT 与正向代理分支（通过 `--user` / `--passwd` 或 `DUCT_USER` / `DUCT_PASSWD`）
 - **进程名伪装**：通过 `--disguise` 指定进程名，绕过基于 argv[0] 的访问控制
 - **高性能**：基于 Rust + tokio 异步运行时，单二进制部署
-- **完整测试覆盖**：27 个单元测试 + 15 个集成测试
+- **完整测试覆盖**：44 个单元测试 + 33 个集成测试（含桥接长头部专项）
 
 ## 安装
 
@@ -23,7 +26,7 @@ cp target/release/duct /usr/local/bin/
 ### 基础用法
 
 ```bash
-# 默认监听 127.0.0.1:10999
+# 默认监听 0.0.0.0:11088（⚠️ 默认端口自本版本起由 10999 变更为 11088）
 duct
 
 # 指定端口
@@ -55,10 +58,10 @@ duct --user alice --passwd p@ss123
 DUCT_USER=alice DUCT_PASSWD=p@ss123 duct
 
 # 配合认证使用 curl
-curl -x http://alice:p@ss123@127.0.0.1:10999 https://httpbin.org/get
+curl -x http://alice:p@ss123@127.0.0.1:11088 https://httpbin.org/get
 
 # 或通过 --proxy-user 参数
-curl -x http://127.0.0.1:10999 --proxy-user alice:p@ss123 https://httpbin.org/get
+curl -x http://127.0.0.1:11088 --proxy-user alice:p@ss123 https://httpbin.org/get
 ```
 
 > **注意**: `--user` 和 `--passwd` 必须同时使用。未提供时认证默认关闭。
@@ -69,26 +72,72 @@ curl -x http://127.0.0.1:10999 --proxy-user alice:p@ss123 https://httpbin.org/ge
 2. 配置代理服务器：
    - 协议：HTTP
    - 地址：127.0.0.1
-   - 端口：10999（默认）
+   - 端口：11088（默认）
 3. 启用代理，访问内网资源
 
 ### 命令行测试
 
 ```bash
 # CONNECT 隧道（HTTPS）
-curl -x http://127.0.0.1:10999 https://httpbin.org/get
+curl -x http://127.0.0.1:11088 https://httpbin.org/get
 
 # HTTP 正向代理
-curl -x http://127.0.0.1:10999 http://httpbin.org/get
+curl -x http://127.0.0.1:11088 http://httpbin.org/get
 ```
+
+### AI 转发反向代理（aiproxy）
+
+在同一端口上，以路径前缀将请求转发至预配置的上游 AI 服务：
+
+```
+{base_url}/aiproxy/{provider}/{剩余路径}  →  {provider.url}/{剩余路径}
+```
+
+**配置**：`~/.config/duct/config.yaml`（或 `--config-file` 指定）。只有 id 与 base url 两项字段，
+**不含任何密钥**——上游凭证由各客户端工具自行配置（ duct 不做上游鉴权）：
+
+```yaml
+providers:
+  openai:
+    url: https://api.openai.com/v1
+  ollama:
+    url: http://ollama:11434
+  anthropic:
+    url: https://api.anthropic.com
+```
+
+**使用**（aider / cline / OpenAI SDK 等，把 base_url 指向前缀即可）：
+
+```bash
+curl http://127.0.0.1:11088/aiproxy/ollama/api/tags
+
+curl http://127.0.0.1:11088/aiproxy/openai/v1/chat/completions \
+  -H "Authorization: Bearer $OPENAI_API_KEY" \
+  -d '{"model":"gpt-4o","messages":[...]}'
+```
+
+```python
+OpenAI(base_url="http://127.0.0.1:11088/aiproxy/openai/v1", api_key=真实key)
+```
+
+语义要点：
+
+- 方法 / 查询串 / 请求体透明透传；响应（含 SSE 流）逐 chunk 回传
+- 头处理为黑名单制：仅剥离逐跳头与 `Proxy-*`，`Authorization` 等一切凭据头原样透传
+- 未注册 provider → 404 OpenAI 兼容 JSON 错误；请求体超过 `--max-body`（默认 16 MiB）→ 413
+- ⚠️ **无鉴权设计**：信任边界 = 内网/防火墙边界，请勿暴露公网
+- 探活：`curl http://127.0.0.1:11088/healthz`（进程级判活，任何配置状态下均可用）
 
 ## 架构
 
 ```
 src/
-├── main.rs      # CLI 入口 + 进程名伪装 + tracing 配置
-├── server.rs    # TCP 接收循环 + CONNECT/HTTP 请求分发 + 认证检查
+├── main.rs      # CLI 入口 + 配置装载 + 进程名伪装 + tracing
+├── server.rs    # TCP 接收循环 + 五分支分流（healthz / aiproxy / CONNECT / 正向代理）+ 认证检查
 ├── connect.rs   # CONNECT 隧道逻辑 + 请求解析 + HTTP 转发
+├── aiproxy.rs   # /aiproxy 反向代理：路由/头处理/流式转发 + 入口桥接
+├── config.rs    # config.yaml 装载（三层语义：缺省禁用/损坏致命/条目跳过）
+├── error.rs     # OpenAI 兼容错误响应
 ├── auth.rs      # HTTP Basic 认证检查 + base64 解码
 └── lib.rs       # 模块导出
 ```
@@ -124,14 +173,17 @@ src/
 duct [OPTIONS]
 
 Options:
-  -p, --port <PORT>         监听端口 [default: 10999]
-  -b, --bind <ADDR>         监听地址 [default: 0.0.0.0]
-  -v, --verbose             启用 debug 级别日志
-  -V, --version             版本信息
-  -h, --help                帮助信息
-      --disguise <NAME>     进程伪装名称（可选，默认不启用）
-      --user <USER>       HTTP Basic 认证用户名（也支持 DUCT_USER 环境变量）
-      --passwd <PASS>     HTTP Basic 认证密码（也支持 DUCT_PASSWD 环境变量）
+  -p, --port <PORT>           监听端口 [default: 11088]（⚠️ 原 10999，升级时注意存量部署）
+  -b, --bind <ADDR>           监听地址 [default: 0.0.0.0]
+  -v, --verbose               启用 debug 级别日志
+      --config-file <PATH>    aiproxy provider 配置（YAML）路径
+                              [默认 ~/.config/duct/config.yaml；缺省文件存在则启用，不存在则禁用 aiproxy]
+      --max-body <BYTES>      aiproxy 请求体上限 [default: 16777216]
+  -V, --version               版本信息
+  -h, --help                  帮助信息
+      --disguise <NAME>       进程伪装名称（可选，默认不启用）
+      --user <USER>         HTTP Basic 认证用户名（也支持 DUCT_USER 环境变量）
+      --passwd <PASS>       HTTP Basic 认证密码（也支持 DUCT_PASSWD 环境变量）
 ```
 
 ## 开发
@@ -183,7 +235,7 @@ RUST_LOG=debug duct -v
 **解决：**
 ```bash
 # 提供正确的凭据
-curl -x http://alice:p@ss123@127.0.0.1:10999 https://httpbin.org/get
+curl -x http://alice:p@ss123@127.0.0.1:11088 https://httpbin.org/get
 ```
 
 ### 问题：连接被拒绝或立即关闭

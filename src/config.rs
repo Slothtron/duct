@@ -19,6 +19,14 @@ use std::path::{Path, PathBuf};
 pub struct ProviderConfig {
     pub id: String,
     pub base_url: String,
+    /// 对上游做 SSE 流兼容归一化：请求侧检测/补齐 `stream` 字段，
+    /// 响应侧对流式工具调用 `function.name` 做归一化。默认 false。
+    /// 开启后：
+    /// - 请求：若 body 为 JSON 对象且缺少 `stream`，显式注入 `"stream": false`
+    ///   （规避把「缺 stream」当作默认流式的网关，如 kso）；
+    /// - 响应：上游为 text/event-stream 时，用 `SseToolNormalizer` 改写
+    ///   重复下发/片段续写的 `function.name` 为合规流。
+    pub normalize_sse: bool,
 }
 
 /// provider 清单；运行期只读共享。
@@ -149,8 +157,16 @@ fn parse_str(content: &str, source: &Path) -> Result<Config> {
                 continue;
             }
         };
+        let normalize_sse = entry
+            .get("normalize_sse")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         index.insert(id.clone(), providers.len());
-        providers.push(ProviderConfig { id, base_url });
+        providers.push(ProviderConfig {
+            id,
+            base_url,
+            normalize_sse,
+        });
     }
 
     Ok(Config { providers, index })
@@ -265,5 +281,27 @@ providers:
             normalize_base_url("  https://a.b/c/  ", "p").unwrap(),
             "https://a.b/c"
         );
+    }
+
+    #[test]
+    fn normalize_sse_flag_default_false_and_parsed() {
+        let cfg = parse(
+            r#"
+providers:
+  plain:
+    url: http://plain:1
+  kso:
+    url: http://kso:1
+    normalize_sse: true
+  off:
+    url: http://off:1
+    normalize_sse: false
+"#,
+        )
+        .unwrap();
+        // 未声明 → false；显式 true → true；显式 false → false
+        assert!(!cfg.get("plain").unwrap().normalize_sse);
+        assert!(cfg.get("kso").unwrap().normalize_sse);
+        assert!(!cfg.get("off").unwrap().normalize_sse);
     }
 }

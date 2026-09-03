@@ -20,6 +20,7 @@ use futures::Stream;
 
 use crate::config::Config;
 use crate::error::AppError;
+use crate::sse_normalize::{SseToolNormalizer, normalize_stream_field};
 
 /// 上游连接超时；不设整体请求超时（SSE 长流不能被总时长掐断，§6.3）。
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -202,6 +203,7 @@ async fn respond_forwarded(
     uri: &Uri,
     headers: HeaderMap,
     body: Body,
+    normalize_sse: bool,
 ) -> Response {
     let provider_id_log = uri.path().split('/').nth(2).unwrap_or("?").to_string();
 
@@ -229,7 +231,18 @@ async fn respond_forwarded(
         .request(method.clone(), url)
         .headers(outgoing_headers);
     if attach_body {
-        send = send.body(limited_body(body, state.max_body));
+        if normalize_sse {
+            // 规范化请求：读取 body（受 --max-body 约束）并补上缺失的 stream 字段，
+            // 让「缺 stream 即流式」的网关对非流式请求返回合规 JSON。
+            match read_and_normalize_body(body, state.max_body).await {
+                Ok(bytes) => {
+                    send = send.body(reqwest::Body::from(bytes));
+                }
+                Err(_) => return AppError::BodyTooLarge.into_response(),
+            }
+        } else {
+            send = send.body(limited_body(body, state.max_body));
+        }
     }
 
     let upstream = match send.send().await {
@@ -260,14 +273,35 @@ async fn respond_forwarded(
         "aiproxy forwarded"
     );
 
+    let upstream_ct = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+
     let stream = upstream.bytes_stream();
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in &response_headers {
         builder = builder.header(name, value);
     }
+    // 工具名归一化仅在「开启 normalize_sse 且上游返回 SSE」时生效；
+    // 其余情况维持现有逐字节透传。
+    let body = if normalize_sse && upstream_ct.starts_with("text/event-stream") {
+        tracing::debug!(provider = %provider_id_log, "sse-normalize: wrapping upstream event-stream with SseToolNormalizer");
+        Body::from_stream(SseToolNormalizer::new(stream))
+    } else {
+        Body::from_stream(stream)
+    };
     builder
-        .body(Body::from_stream(stream))
+        .body(body)
         .unwrap_or_else(|e| AppError::UpstreamError(e.to_string()).into_response())
+}
+
+/// 读取请求体(受 `--max-body` 约束)并对缺失的 `stream` 字段做归一化。
+async fn read_and_normalize_body(body: Body, max_body: usize) -> Result<Bytes, axum::Error> {
+    let bytes = axum::body::to_bytes(body, max_body).await?;
+    Ok(normalize_stream_field(bytes))
 }
 
 /// reqwest 在发送途中因流错误中止时，错误源链里能找到我们的限长标记。
@@ -320,7 +354,18 @@ async fn dispatch_forward(
         return provider_not_found(&provider, &state.config).into_response();
     };
     let base_url = p.base_url.clone();
-    respond_forwarded(&state, &method, &base_url, rest, &uri, headers, body).await
+    let normalize_sse = p.normalize_sse;
+    respond_forwarded(
+        &state,
+        &method,
+        &base_url,
+        rest,
+        &uri,
+        headers,
+        body,
+        normalize_sse,
+    )
+    .await
 }
 
 // ── 入口桥接（T7，设计文档 §11-R1）────────────────────────────────────

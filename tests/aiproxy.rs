@@ -14,7 +14,7 @@ use bytes::Bytes;
 use futures::StreamExt;
 use tower::util::ServiceExt;
 
-use duct::aiproxy::{router, AppState, serve_standalone};
+use duct::aiproxy::{AppState, router, serve_standalone};
 use duct::config::Config;
 
 static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
@@ -40,6 +40,8 @@ enum Behavior {
     Echo,
     /// SSE：N 个 data chunk，间隔 delay_ms。
     Sse { chunks: usize, delay_ms: u64 },
+    /// kso 风格：SSE 流中每个 chunk 重复下发完整 function.name（协议违规）。
+    SseRepeatedName,
     /// 固定状态码与附加头。
     Status {
         code: u16,
@@ -47,6 +49,18 @@ enum Behavior {
         extra_headers: Vec<(&'static str, &'static str)>,
     },
 }
+
+/// kso 风格重复工具名 SSE 负载(不含 chunked 帧，仅为 data 行)。
+const SSE_REPEATED_NAME: &str = r##"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"list_dir","arguments":""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"list_dir","arguments":"{\"path\": "}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"list_dir","arguments":"\"/\""}}]}}]}
+
+data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}
+
+data: [DONE]
+"##;
 
 #[derive(Clone, Debug)]
 struct Record {
@@ -188,6 +202,13 @@ fn spawn_mock(behavior: Behavior) -> MockUpstream {
                             }
                             sock.write_all(b"0\r\n\r\n").await.ok();
                         }
+                        Behavior::SseRepeatedName => {
+                            let head = "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n";
+                            sock.write_all(head.as_bytes()).await.ok();
+                            let framed = format!("{:x}\r\n{}\r\n", SSE_REPEATED_NAME.len(), SSE_REPEATED_NAME);
+                            sock.write_all(framed.as_bytes()).await.ok();
+                            sock.write_all(b"0\r\n\r\n").await.ok();
+                        }
                         Behavior::Status {
                             code,
                             body,
@@ -257,7 +278,9 @@ async fn oneshot(
 }
 
 async fn body_bytes(resp: axum::http::Response<Body>) -> Bytes {
-    axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap()
+    axum::body::to_bytes(resp.into_body(), 1 << 20)
+        .await
+        .unwrap()
 }
 
 const UNIQUE_HEADER_VALUE: &str = "Bearer sk-secret~!@#$%^&*()_+-={}[]|\\:<>?,./;'";
@@ -325,7 +348,10 @@ async fn credentials_pass_through_byte_exact() {
         app_state(config, 16 << 20),
         "GET",
         "/aiproxy/mock/api/tags",
-        &[("authorization", UNIQUE_HEADER_VALUE), ("x-api-key", "&%$#@! special=value")],
+        &[
+            ("authorization", UNIQUE_HEADER_VALUE),
+            ("x-api-key", "&%$#@! special=value"),
+        ],
         None,
     )
     .await;
@@ -338,7 +364,14 @@ async fn credentials_pass_through_byte_exact() {
 async fn unknown_provider_is_404_openai_json() {
     let mock = spawn_mock(Behavior::Echo);
     let config = config_from_yaml(&format!("  mock:\n    url: {}", mock.base_url()));
-    let resp = oneshot(app_state(config, 16 << 20), "GET", "/aiproxy/nope/v1/x", &[], None).await;
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "GET",
+        "/aiproxy/nope/v1/x",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), 404);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["error"]["type"], "invalid_request_error");
@@ -348,13 +381,22 @@ async fn unknown_provider_is_404_openai_json() {
 #[tokio::test]
 async fn empty_config_lists_nothing() {
     let config = config_from_yaml("  {}: {}"); // providers: {} 空
-    let resp = oneshot(app_state(config, 16 << 20), "GET", "/aiproxy/x/y", &[], None).await;
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "GET",
+        "/aiproxy/x/y",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), 404);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-    assert!(json["error"]["message"]
-        .as_str()
-        .unwrap()
-        .contains("(none configured)"));
+    assert!(
+        json["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("(none configured)")
+    );
 }
 
 #[tokio::test]
@@ -376,7 +418,10 @@ async fn oversized_content_length_rejected_before_upstream_contact() {
 
 #[tokio::test]
 async fn sse_streams_all_chunks_in_order() {
-    let mock = spawn_mock(Behavior::Sse { chunks: 5, delay_ms: 20 });
+    let mock = spawn_mock(Behavior::Sse {
+        chunks: 5,
+        delay_ms: 20,
+    });
     let config = config_from_yaml(&format!("  mock:\n    url: {}", mock.base_url()));
     let resp = oneshot(
         app_state(config, 16 << 20),
@@ -387,13 +432,14 @@ async fn sse_streams_all_chunks_in_order() {
     )
     .await;
     assert_eq!(resp.status(), 200);
-    assert!(resp
-        .headers()
-        .get("content-type")
-        .unwrap()
-        .to_str()
-        .unwrap()
-        .starts_with("text/event-stream"));
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
 
     let mut stream = resp.into_body().into_data_stream();
     let mut collected = Vec::new();
@@ -402,7 +448,10 @@ async fn sse_streams_all_chunks_in_order() {
     }
     let text = String::from_utf8(collected).unwrap();
     for i in 0..5 {
-        assert!(text.contains(&format!("data: chunk-{i}\n")), "missing {i}: {text}");
+        assert!(
+            text.contains(&format!("data: chunk-{i}\n")),
+            "missing {i}: {text}"
+        );
     }
 }
 
@@ -414,12 +463,16 @@ async fn upstream_error_status_passed_through_verbatim() {
         extra_headers: vec![("x-upstream-cause", "unit-test")],
     });
     let config = config_from_yaml(&format!("  mock:\n    url: {}", mock.base_url()));
-    let resp = oneshot(app_state(config, 16 << 20), "GET", "/aiproxy/mock/v1/x", &[], None).await;
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "GET",
+        "/aiproxy/mock/v1/x",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), 500);
-    assert_eq!(
-        resp.headers().get("x-upstream-cause").unwrap(),
-        "unit-test"
-    );
+    assert_eq!(resp.headers().get("x-upstream-cause").unwrap(), "unit-test");
     let body = body_bytes(resp).await;
     assert!(String::from_utf8_lossy(&body).contains("upstream boom"));
 }
@@ -431,7 +484,14 @@ async fn unreachable_provider_maps_to_502() {
     let port = dead.local_addr().unwrap().port();
     drop(dead); // 释放以复现 connection refused
     let config = config_from_yaml(&format!("  dead:\n    url: http://127.0.0.1:{port}"));
-    let resp = oneshot(app_state(config, 16 << 20), "GET", "/aiproxy/dead/v1/x", &[], None).await;
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "GET",
+        "/aiproxy/dead/v1/x",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), 502);
     let json: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
     assert_eq!(json["error"]["type"], "upstream_error");
@@ -440,7 +500,14 @@ async fn unreachable_provider_maps_to_502() {
 #[tokio::test]
 async fn dns_failure_maps_to_502() {
     let config = config_from_yaml("  ghost:\n    url: http://duct-test-nonexistent.invalid");
-    let resp = oneshot(app_state(config, 16 << 20), "GET", "/aiproxy/ghost/v1/x", &[], None).await;
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "GET",
+        "/aiproxy/ghost/v1/x",
+        &[],
+        None,
+    )
+    .await;
     assert_eq!(resp.status(), 502);
 }
 
@@ -488,4 +555,122 @@ async fn standalone_serving_smoke_over_real_socket() {
 
     drop(sock);
     server.abort();
+}
+
+#[tokio::test]
+async fn normalize_sse_injects_stream_false_when_missing() {
+    let mock = spawn_mock(Behavior::Echo);
+    let config = config_from_yaml(&format!(
+        "  mock:\n    url: {}\n    normalize_sse: true",
+        mock.base_url()
+    ));
+
+    // 非流式请求：body 不含 stream 字段。
+    let payload = br#"{"model":"m","messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "POST",
+        "/aiproxy/mock/v1/chat/completions",
+        &[("content-type", "application/json")],
+        Some(payload.to_vec()),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let rec = &mock.records()[0];
+    let sent = String::from_utf8_lossy(&rec.body);
+    assert!(
+        sent.contains(r#""stream":false"#),
+        "normalize_sse 应注入 stream:false，实际 body: {sent}"
+    );
+}
+
+#[tokio::test]
+async fn normalize_sse_keeps_explicit_stream_untouched() {
+    let mock = spawn_mock(Behavior::Echo);
+    let config = config_from_yaml(&format!(
+        "  mock:\n    url: {}\n    normalize_sse: true",
+        mock.base_url()
+    ));
+
+    // 流式请求：body 已带 stream:true，不应被改写。
+    let payload = br#"{"model":"m","stream":true,"messages":[{"role":"user","content":"hi"}]}"#;
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "POST",
+        "/aiproxy/mock/v1/chat/completions",
+        &[("content-type", "application/json")],
+        Some(payload.to_vec()),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let rec = &mock.records()[0];
+    let v: serde_json::Value = serde_json::from_slice(&rec.body).unwrap();
+    assert_eq!(v["stream"], true, "显式 stream:true 不得被改写: {:?}", v);
+}
+
+#[tokio::test]
+async fn normalize_sse_collapses_repeated_name_in_stream() {
+    let mock = spawn_mock(Behavior::SseRepeatedName);
+    let config = config_from_yaml(&format!(
+        "  mock:\n    url: {}\n    normalize_sse: true",
+        mock.base_url()
+    ));
+
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "POST",
+        "/aiproxy/mock/v1/chat/completions",
+        &[("content-type", "application/json")],
+        Some(b"{}".to_vec()),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+    assert!(
+        resp.headers()
+            .get("content-type")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .starts_with("text/event-stream")
+    );
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut collected = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        collected.extend_from_slice(&chunk.unwrap());
+    }
+    let text = String::from_utf8(collected).unwrap();
+    // 每个 tool-call index 只保留首帧 name
+    assert_eq!(text.matches(r#""name":"list_dir""#).count(), 1, "{text}");
+    assert!(text.contains(r#""arguments":"{\"path\": ""#), "{text}");
+    assert!(text.contains(r#""arguments":"\"/\""#), "{text}");
+}
+
+#[tokio::test]
+async fn normalize_sse_off_is_byte_identical() {
+    let mock = spawn_mock(Behavior::SseRepeatedName);
+    let config = config_from_yaml(&format!(
+        "  mock:\n    url: {}\n    normalize_sse: false",
+        mock.base_url()
+    ));
+
+    let resp = oneshot(
+        app_state(config, 16 << 20),
+        "POST",
+        "/aiproxy/mock/v1/chat/completions",
+        &[("content-type", "application/json")],
+        Some(b"{}".to_vec()),
+    )
+    .await;
+    assert_eq!(resp.status(), 200);
+
+    let mut stream = resp.into_body().into_data_stream();
+    let mut collected = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        collected.extend_from_slice(&chunk.unwrap());
+    }
+    // normalize_sse=false：逐字节透传，与 mock 上游负载完全一致。
+    assert_eq!(&collected[..], SSE_REPEATED_NAME.as_bytes());
 }

@@ -32,12 +32,47 @@ pub struct ProviderConfig {
     pub normalize_sse: bool,
 }
 
-/// provider 清单；运行期只读共享。
+/// MCP 上游请求头的 Origin 处理策略（设计 §5.5，防上游 DNS-rebinding 校验误杀）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OriginPolicy {
+    /// 透传客户端 Origin（含无 Origin 时不造）。默认值。
+    #[default]
+    Keep,
+    /// 剥掉 Origin。
+    Strip,
+    /// 改写为 server.url 的 origin。
+    Upstream,
+}
+
+impl OriginPolicy {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            OriginPolicy::Keep => "keep",
+            OriginPolicy::Strip => "strip",
+            OriginPolicy::Upstream => "upstream",
+        }
+    }
+}
+
+/// 单个 MCP server 的运行期配置（设计 §5.1，本期仅 url + origin_policy 两键）。
+#[derive(Debug, Clone)]
+pub struct McpServerConfig {
+    pub id: String,
+    /// 上游完整端点（不含 query）；经 normalize_base_url 归一化。
+    pub url: String,
+    /// Origin 头策略；默认 keep。
+    pub origin_policy: OriginPolicy,
+}
+
+/// provider + MCP server 清单；运行期只读共享。
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     /// 保持声明顺序，供错误信息与日志按配置顺序展示。
     providers: Vec<ProviderConfig>,
     index: HashMap<String, usize>,
+    /// MCP server 清单（顺序敏感，供 404 列表与日志）。
+    mcp_servers: Vec<McpServerConfig>,
+    mcp_index: HashMap<String, usize>,
 }
 
 impl Config {
@@ -58,6 +93,21 @@ impl Config {
     /// 全部 provider id（保持配置顺序），用于 404 错误信息。
     pub fn provider_ids(&self) -> Vec<&str> {
         self.providers.iter().map(|p| p.id.as_str()).collect()
+    }
+
+    /// 按 id 查找 MCP server。
+    pub fn get_mcp(&self, id: &str) -> Option<&McpServerConfig> {
+        self.mcp_index.get(id).map(|&i| &self.mcp_servers[i])
+    }
+
+    /// 全部 MCP server id（保持配置顺序），用于 404 错误信息与启动日志。
+    pub fn mcp_server_ids(&self) -> Vec<&str> {
+        self.mcp_servers.iter().map(|s| s.id.as_str()).collect()
+    }
+
+    /// MCP server 是否为空（无已配置 server）。
+    pub fn mcp_is_empty(&self) -> bool {
+        self.mcp_servers.is_empty()
     }
 
     /// 解析默认路径下的配置；不存在返回 None。
@@ -102,9 +152,13 @@ fn is_valid_provider_id(id: &str) -> bool {
     chars.all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_' || c == '-')
 }
 
-/// 校验并归一化 base url：要求 http(s)，去除尾部 `/`，host 非空。
+/// 校验并归一化 base url：要求 http(s)，去除尾部 `/`，host 非空，
+/// **禁止 query/fragment**（凭证不进配置文件，P5 一致性）。
 fn normalize_base_url(raw: &str, id: &str) -> Result<String> {
     let trimmed = raw.trim();
+    if trimmed.contains('?') || trimmed.contains('#') {
+        anyhow::bail!("{id}: url 不得包含 query 或 fragment（凭证不进配置文件）");
+    }
     let (scheme, rest) = trimmed
         .split_once("://")
         .context(format!("provider '{id}': url 缺少 scheme"))?;
@@ -118,15 +172,44 @@ fn normalize_base_url(raw: &str, id: &str) -> Result<String> {
     Ok(trimmed.trim_end_matches('/').to_string())
 }
 
-/// 解析 YAML 文本为 provider 清单；无效条目跳过并 WARN。
+/// 解析 YAML 文本为 provider + MCP server 清单；无效条目跳过并 WARN。
 ///
 /// 以 `serde_yaml::Value` 中转而非直接反序列化到结构体，
 /// 以获得重复 id 检测与逐条目错误定位能力。
+/// 三层语义（§5.1）：`providers` 与 `mcp` **均变为可选段，但至少要有一个**；
+/// 两者皆缺 → 文件级错误。
 fn parse_str(content: &str, source: &Path) -> Result<Config> {
     let value: serde_yaml::Value = serde_yaml::from_str(content)
         .with_context(|| format!("解析配置失败: {}", source.display()))?;
 
-    let providers_value = value.get("providers").context("配置缺少 'providers' 段")?;
+    let has_providers = value.get("providers").is_some();
+    let has_mcp = value.get("mcp").is_some();
+    if !has_providers && !has_mcp {
+        anyhow::bail!(
+            "配置至少需要 'providers' 或 'mcp' 段之一（两者皆缺属文件级错误）: {}",
+            source.display()
+        );
+    }
+
+    let mut cfg = Config::default();
+    if let Some(providers_value) = value.get("providers") {
+        let (providers, index) = parse_providers(providers_value, source)?;
+        cfg.providers = providers;
+        cfg.index = index;
+    }
+    if let Some(mcp_value) = value.get("mcp") {
+        let (mcp_servers, mcp_index) = parse_mcp_servers(mcp_value, source)?;
+        cfg.mcp_servers = mcp_servers;
+        cfg.mcp_index = mcp_index;
+    }
+    Ok(cfg)
+}
+
+/// 解析 `providers` 段。
+fn parse_providers(
+    providers_value: &serde_yaml::Value,
+    source: &Path,
+) -> Result<(Vec<ProviderConfig>, HashMap<String, usize>)> {
     let mapping = providers_value
         .as_mapping()
         .context("'providers' 段必须是映射（id → {url}）")?;
@@ -176,7 +259,91 @@ fn parse_str(content: &str, source: &Path) -> Result<Config> {
         });
     }
 
-    Ok(Config { providers, index })
+    Ok((providers, index))
+}
+
+/// 解析 `mcp` 段（`mcp.servers.<id>.{url, origin_policy}`）。
+///
+/// 未知键（如二期预留的 `transport`）静默忽略；个别条目非法跳过 + WARN，
+/// 与 provider 条目互不影响。
+fn parse_mcp_servers(
+    mcp_value: &serde_yaml::Value,
+    source: &Path,
+) -> Result<(Vec<McpServerConfig>, HashMap<String, usize>)> {
+    let mcp_mapping = mcp_value
+        .as_mapping()
+        .context("'mcp' 段必须是映射（servers: {id → {url}}）")?;
+
+    let mut servers = Vec::new();
+    let mut mcp_index = HashMap::new();
+    let mut seen = HashSet::new();
+
+    // `mcp:`（null）或 `mcp: {}` 均视为 0 个 server（合法）。
+    if mcp_value.is_null() || mcp_mapping.is_empty() {
+        return Ok((servers, mcp_index));
+    }
+    // mcp 段存在但无 servers —— 视为 0 个 server（合法）。
+    let Some(servers_value) = mcp_value.get("servers") else {
+        return Ok((servers, mcp_index));
+    };
+    let Some(servers_map) = servers_value.as_mapping() else {
+        anyhow::bail!("'mcp.servers' 段必须是映射（id → {{url, origin_policy}}）");
+    };
+
+    for (key, entry) in servers_map {
+        let Some(id) = key.as_str().map(|s| s.to_string()) else {
+            tracing::warn!(file = %source.display(), "跳过非字符串 mcp server id: {key:?}");
+            continue;
+        };
+        if !seen.insert(id.clone()) {
+            tracing::warn!(file = %source.display(), server = %id, "检测到重复的 mcp server id 条目");
+            continue;
+        }
+        if !is_valid_provider_id(&id) {
+            tracing::warn!(file = %source.display(), server = %id, "非法的 mcp server id（需匹配 [a-z0-9][a-z0-9_-]*），条目已跳过");
+            continue;
+        }
+        let url = match entry.get("url").and_then(|v| v.as_str()) {
+            Some(u) => u,
+            None => {
+                tracing::warn!(file = %source.display(), server = %id, "缺少 url 字段，条目已跳过");
+                continue;
+            }
+        };
+        let base_url = match normalize_base_url(url, &id) {
+            Ok(u) => u,
+            Err(e) => {
+                tracing::warn!(file = %source.display(), server = %id, "{e:#}，条目已跳过");
+                continue;
+            }
+        };
+        let origin_policy = entry
+            .get("origin_policy")
+            .and_then(|v| v.as_str())
+            .map(parse_origin_policy)
+            .unwrap_or_default();
+        mcp_index.insert(id.clone(), servers.len());
+        servers.push(McpServerConfig {
+            id,
+            url: base_url,
+            origin_policy,
+        });
+    }
+
+    Ok((servers, mcp_index))
+}
+
+/// 解析 origin_policy 字符串；未知值 WARN 并默认 keep。
+fn parse_origin_policy(s: &str) -> OriginPolicy {
+    match s {
+        "keep" => OriginPolicy::Keep,
+        "strip" => OriginPolicy::Strip,
+        "upstream" => OriginPolicy::Upstream,
+        other => {
+            tracing::warn!(value = %other, "未知的 origin_policy 值（应为 keep|strip|upstream），默认 keep");
+            OriginPolicy::Keep
+        }
+    }
 }
 
 impl Config {
@@ -313,5 +480,114 @@ providers:
         assert!(!cfg.get("plain").unwrap().normalize_sse);
         assert!(cfg.get("kso").unwrap().normalize_sse);
         assert!(!cfg.get("off").unwrap().normalize_sse);
+    }
+
+    // ── MCP 段（设计 §5.1 / §8 C1–C6）─────────────────────────────────
+
+    #[test]
+    fn c1_pure_providers_old_file_still_loads() {
+        // 纯 providers 旧文件（无 mcp 段）向后兼容
+        let cfg = parse("providers:\n  p:\n    url: http://p:1\n").unwrap();
+        assert_eq!(cfg.provider_ids(), vec!["p"]);
+        assert!(cfg.mcp_is_empty());
+        assert_eq!(cfg.mcp_server_ids(), Vec::<&str>::new());
+    }
+
+    #[test]
+    fn c2_pure_mcp_file() {
+        let cfg = parse(
+            r#"
+mcp:
+  servers:
+    github:
+      url: https://api.githubcopilot.com/mcp
+    filesystem:
+      url: http://127.0.0.1:9100/mcp
+      origin_policy: strip
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mcp_server_ids(), vec!["github", "filesystem"]);
+        assert!(cfg.is_empty()); // providers 为空（is_empty 反映 providers）
+        let g = cfg.get_mcp("github").unwrap();
+        assert_eq!(g.url, "https://api.githubcopilot.com/mcp");
+        assert_eq!(g.origin_policy, OriginPolicy::Keep);
+        // 尾斜杠归一化
+        let f = cfg.get_mcp("filesystem").unwrap();
+        assert_eq!(f.url, "http://127.0.0.1:9100/mcp");
+        assert_eq!(f.origin_policy, OriginPolicy::Strip);
+    }
+
+    #[test]
+    fn c3_dual_sections_coexist() {
+        let cfg = parse(
+            r#"
+providers:
+  openai:
+    url: https://api.openai.com/v1
+mcp:
+  servers:
+    github:
+      url: https://api.githubcopilot.com/mcp
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.provider_ids(), vec!["openai"]);
+        assert_eq!(cfg.mcp_server_ids(), vec!["github"]);
+    }
+
+    #[test]
+    fn c4_both_missing_is_file_level_error() {
+        // 两段皆缺 → 文件级错误（三层语义第二层，致命）
+        assert!(parse("other: 1").is_err());
+        // 空文件同样致命
+        assert!(parse("").is_err());
+    }
+
+    #[test]
+    fn c5_invalid_entries_skipped_others_survive() {
+        let cfg = parse(
+            r#"
+mcp:
+  servers:
+    bad-scheme:
+      url: ftp://example.com
+    query-key:
+      url: https://example.com/mcp?token=secret
+    BadCap:
+      url: http://example.com/mcp
+    good:
+      url: https://ok.example.com/mcp
+"#,
+        )
+        .unwrap();
+        // 仅 good 存活（非法 scheme / url 带 query / 非法 id 全部跳过）
+        assert_eq!(cfg.mcp_server_ids(), vec!["good"]);
+    }
+
+    #[test]
+    fn c6_mcp_defaults_and_unknown_keys_ignored() {
+        let cfg = parse(
+            r#"
+mcp:
+  servers:
+    gh:
+      url: https://api.githubcopilot.com/mcp
+      transport: http_sse   # 二期预留键，本期未知键静默忽略
+      origin_policy: bogus  # 非法值 → 默认 keep
+"#,
+        )
+        .unwrap();
+        let gh = cfg.get_mcp("gh").unwrap();
+        assert_eq!(gh.origin_policy, OriginPolicy::Keep);
+        assert_eq!(gh.url, "https://api.githubcopilot.com/mcp");
+    }
+
+    #[test]
+    fn origin_policy_parsing() {
+        assert_eq!(parse_origin_policy("keep"), OriginPolicy::Keep);
+        assert_eq!(parse_origin_policy("strip"), OriginPolicy::Strip);
+        assert_eq!(parse_origin_policy("upstream"), OriginPolicy::Upstream);
+        assert_eq!(parse_origin_policy("bogus"), OriginPolicy::Keep);
     }
 }

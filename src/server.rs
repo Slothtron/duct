@@ -1,10 +1,13 @@
 use anyhow::{Context, Result, bail};
+use std::sync::Arc;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
 use crate::aiproxy::AppState;
 use crate::auth::{self, AuthConfig};
+use crate::config::Config;
 use crate::connect;
+use crate::mcp::McpState;
 
 /// Maximum length of the request line before returning 414.
 const MAX_REQUEST_LINE_BYTES: usize = 8192;
@@ -31,14 +34,27 @@ pub async fn run_with_aiproxy_from_listener(
     auth: Option<AuthConfig>,
     aiproxy_state: AppState,
 ) -> Result<()> {
+    // 兼容旧入口：附属一个空 mcp state（无 server，`/mcp/*` 全 404）。
+    let mcp_state = McpState::new(Arc::new(Config::default()), aiproxy_state.max_body)?;
+    run_with_states_from_listener(listener, auth, aiproxy_state, mcp_state).await
+}
+
+/// 双 state 完整形态：aiproxy + mcp 各自独立装配，共享同一 `Arc<Config>`。
+pub async fn run_with_states_from_listener(
+    listener: TcpListener,
+    auth: Option<AuthConfig>,
+    aiproxy: AppState,
+    mcp: McpState,
+) -> Result<()> {
     tracing::info!("duct listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         tracing::debug!(%peer_addr, "new connection");
         let auth = auth.clone();
-        let state = aiproxy_state.clone();
+        let aiproxy = aiproxy.clone();
+        let mcp = mcp.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, auth.as_ref(), &state).await {
+            if let Err(e) = handle_connection(stream, auth.as_ref(), &aiproxy, &mcp).await {
                 tracing::warn!(%peer_addr, error = %e, "connection error");
             }
         });
@@ -122,7 +138,7 @@ async fn read_headers(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8
         window[2] = window[3];
         window[3] = byte[0];
         window_len += 1;
-        if window_len >= 4 && window == [b'\r', b'\n', b'\r', b'\n'] {
+        if window_len >= 4 && window == *b"\r\n\r\n" {
             break;
         }
     }
@@ -133,6 +149,7 @@ async fn handle_connection(
     mut stream: TcpStream,
     auth: Option<&AuthConfig>,
     aiproxy: &AppState,
+    mcp: &McpState,
 ) -> Result<()> {
     // Read the request line
     let line = read_line(&mut stream, MAX_REQUEST_LINE_BYTES)
@@ -146,10 +163,10 @@ async fn handle_connection(
     // Determine method
     let method = line.split_whitespace().next().unwrap_or("");
 
-    // ── 分流判定（设计文档 §5.1 五分支）─────────────────────────────
+    // ── 分流判定（设计文档 §5.1 六分支）─────────────────────────────
     // origin-form（相对路径）请求先行判定：/healthz 探活、/aiproxy/* 反向代理、
-    // 其余一律 400。CONNECT 与 absolute-form 不受影响，Basic 认证仍仅作用于
-    // 这两条既有分支（P6：认证禁止上提至共享分流层）。
+    // /mcp/* MCP 转发、其余一律 400。CONNECT 与 absolute-form 不受影响，Basic 认证
+    // 仍仅作用于这两条既有分支（P6：认证禁止上提至共享分流层）。
     let origin_uri = (method != "CONNECT")
         .then(|| line.split_whitespace().nth(1))
         .flatten()
@@ -174,14 +191,22 @@ async fn handle_connection(
             return crate::aiproxy::serve_conn_from_prelude(aiproxy.clone(), &prelude, stream)
                 .await;
         }
+        // 序 2：mcp —— 路径段 1 == mcp（含裸 /mcp，由 mcp router 回 404 列表）
+        if segments.len() >= 2 && segments[1] == "mcp" {
+            tracing::debug!(path = %uri, "dispatch to mcp");
+            let mut prelude = line.clone().into_bytes();
+            prelude.push(b'\r');
+            prelude.push(b'\n');
+            return crate::mcp::serve_conn_from_prelude(mcp.clone(), &prelude, stream).await;
+        }
         // 序 5：其余相对路径兜底拒绝 —— duct 不是反向代理
-        tracing::debug!(path = %uri, "non-aiproxy relative path rejected");
+        tracing::debug!(path = %uri, "non-aiproxy non-mcp relative path rejected");
         let _ = stream
             .write_all(
                 b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
             )
             .await;
-        bail!("relative path requests are only supported under /aiproxy/");
+        bail!("relative path requests are only supported under /aiproxy/ or /mcp/");
     }
 
     match method {

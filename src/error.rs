@@ -18,6 +18,13 @@ pub enum AppError {
         available: String,
     },
 
+    /// mcp server id 未注册或不合法。
+    #[error("MCP server '{requested}' not found. Available servers: {available}")]
+    ServerNotFound {
+        requested: String,
+        available: String,
+    },
+
     /// 配置未装载（aiproxy 功能未启用），对外表现与无可用 provider 一致。
     #[error("aiproxy is not configured on this instance. Available providers: none")]
     AiproxyDisabled,
@@ -53,6 +60,7 @@ impl AppError {
             AppError::ProviderNotFound { .. } | AppError::AiproxyDisabled => {
                 (StatusCode::NOT_FOUND, "invalid_request_error")
             }
+            AppError::ServerNotFound { .. } => (StatusCode::NOT_FOUND, "invalid_request_error"),
             AppError::BodyTooLarge => (StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error"),
             AppError::UpstreamError(_) => (StatusCode::BAD_GATEWAY, "upstream_error"),
             AppError::UpstreamTimeout => (StatusCode::GATEWAY_TIMEOUT, "upstream_error"),

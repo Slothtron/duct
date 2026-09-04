@@ -4,6 +4,8 @@ use std::env;
 use std::os::unix::process::CommandExt;
 
 use duct::auth::AuthConfig;
+use duct::config::Config;
+use duct::mcp::McpState;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -131,33 +133,26 @@ async fn main() -> anyhow::Result<()> {
 
     let addr = format!("{}:{}", cli.bind, cli.port);
 
-    // ── aiproxy 配置装载（三层语义，§6.2）──
+    // ── 配置装载（三层语义，§6.2；providers 与 mcp 均为可选段但至少要有一个）──
     let config = match &cli.config_file {
         Some(path) => {
-            let cfg = duct::config::Config::load_explicit(std::path::Path::new(path))
-                .with_context(|| format!("加载 aiproxy 配置失败: {path}"))?;
-            tracing::info!(
-                providers = cfg.len(),
-                ids = %cfg.provider_ids().join(","),
-                "aiproxy enabled"
-            );
+            let cfg = Config::load_explicit(std::path::Path::new(path))
+                .with_context(|| format!("加载 aiproxy/mcp 配置失败: {path}"))?;
+            log_config_features(&cfg);
             cfg
         }
-        None => match duct::config::Config::load_default()? {
+        None => match Config::load_default()? {
             Some(cfg) => {
-                tracing::info!(
-                    providers = cfg.len(),
-                    ids = %cfg.provider_ids().join(","),
-                    "aiproxy enabled"
-                );
+                log_config_features(&cfg);
                 cfg
             }
             None => {
-                tracing::info!("aiproxy disabled (no provider config found)");
-                duct::config::Config::default()
+                tracing::info!("aiproxy/mcp disabled (no config file found)");
+                Config::default()
             }
         },
     };
+    let config = std::sync::Arc::new(config);
 
     // ── 请求轨迹 sink（JSONL，参考 DSH 会话轨迹设计）；打开失败降级为 tracing-only ──
     let trace_sink = match cli.trace_file.as_deref() {
@@ -183,13 +178,16 @@ async fn main() -> anyhow::Result<()> {
         }
     };
 
-    let state = duct::aiproxy::AppState::with_trace_body(
-        std::sync::Arc::new(config),
+    let aiproxy_state = duct::aiproxy::AppState::with_trace_body(
+        config.clone(),
         cli.max_body,
-        trace_sink,
+        trace_sink.clone(),
         cli.trace_body,
     )
     .context("构建 aiproxy 状态失败")?;
+
+    let mcp_state = McpState::with_trace_body(config, cli.max_body, trace_sink, cli.trace_body)
+        .context("构建 mcp 状态失败")?;
 
     if cli.trace_body > 0 {
         tracing::warn!(
@@ -201,7 +199,25 @@ async fn main() -> anyhow::Result<()> {
     tracing::info!(%addr, auth = auth.is_some(), "starting duct");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
-    duct::server::run_with_aiproxy_from_listener(listener, auth, state).await
+    duct::server::run_with_states_from_listener(listener, auth, aiproxy_state, mcp_state).await
+}
+
+/// 启动日志：分别汇报 aiproxy providers 与 mcp servers 数量与 id。
+fn log_config_features(cfg: &Config) {
+    tracing::info!(
+        providers = cfg.len(),
+        ids = %cfg.provider_ids().join(","),
+        "aiproxy enabled"
+    );
+    if cfg.mcp_is_empty() {
+        tracing::info!("mcp disabled (no mcp servers configured)");
+    } else {
+        tracing::info!(
+            mcp_servers = cfg.mcp_server_ids().len(),
+            ids = %cfg.mcp_server_ids().join(","),
+            "mcp enabled"
+        );
+    }
 }
 
 /// 展开开头的 `~` 为 $HOME（无 HOME 时保持原样，由上层报错/降级）。

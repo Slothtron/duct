@@ -54,7 +54,7 @@ ExecStart=/usr/local/bin/duct \
     --bind 0.0.0.0 \
     --port 11088
 
-# aiproxy：provider 配置（YAML，仅 id + url 两字段、无密钥）
+# aiproxy + mcp：配置（YAML，provider 仅 id + url；mcp server 为 id + url(+origin_policy)、无密钥）
 # 缺省读 ~/.config/duct/config.yaml；systemd 下 ProtectHome=yes 时 HOME 受限，
 # 显式指定放到 /etc 下更稳妥：
 # ExecStart=/usr/local/bin/duct \
@@ -82,8 +82,10 @@ ExecStart=/usr/local/bin/duct \
 # 注：凭据通过 EnvironmentFile 中的 DUCT_USER / DUCT_PASSWD 传入
 # 不在 argv 中，ps -ef 不可见
 
-# ⚠️ 安全边界声明：aiproxy 分支无鉴权（凭证零接触、不存 Key），
+# ⚠️ 安全边界声明：aiproxy 与 mcp 分支均无鉴权（凭证零接触、不存 Key），
 # 整个服务必须在防火墙后或仅绑定内网地址，严禁直接暴露公网。
+# 尤其 /mcp 分支：上游 MCP server 通常可执行工具（读写文件/执行命令），
+# 暴露面比 /aiproxy 更敏感——公网场景必须先套一层鉴权反代。
 
 # 探活建议（systemd 原生对 Type=simple 无内建 HTTP 探活）：
 #   方式一：cron/timer 定期 `curl -fsS http://127.0.0.1:11088/healthz`

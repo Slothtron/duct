@@ -239,11 +239,12 @@ impl ToolNameRewriter {
                 let Some(fobj) = tc.get("function").and_then(|f| f.as_object()) else {
                     continue;
                 };
-                if !fobj.contains_key("name") && !fobj.contains_key("arguments") {
-                    if let Some(tcobj) = tc.as_object_mut() {
-                        tcobj.remove("function");
-                        changed = true;
-                    }
+                if !fobj.contains_key("name")
+                    && !fobj.contains_key("arguments")
+                    && let Some(tcobj) = tc.as_object_mut()
+                {
+                    tcobj.remove("function");
+                    changed = true;
                 }
             }
         }
@@ -570,10 +571,7 @@ mod tests {
                 .map(|c| Ok::<Bytes, std::convert::Infallible>(Bytes::copy_from_slice(c))),
         );
         let out: Vec<Result<Bytes, _>> = SseToolNormalizer::new(src).collect().await;
-        out.into_iter()
-            .map(|r| r.unwrap().to_vec())
-            .flatten()
-            .collect()
+        out.into_iter().flat_map(|r| r.unwrap().to_vec()).collect()
     }
 
     /// 构造带 tool_calls 的 SSE data 行。name 为 Some 时携带 function.name。
@@ -635,11 +633,8 @@ mod tests {
             let end = (i + split).min(encoded.len());
             parts.push(Bytes::from(encoded[i..end].to_vec()));
         }
-        let src = futures::stream::iter(
-            parts
-                .into_iter()
-                .map(|b| Ok::<Bytes, std::convert::Infallible>(b)),
-        );
+        let src =
+            futures::stream::iter(parts.into_iter().map(Ok::<Bytes, std::convert::Infallible>));
         let out: Vec<Result<Bytes, _>> = SseRewindStream::new(src, kind).collect().await;
         out.into_iter()
             .flat_map(|r| r.unwrap().to_vec())
@@ -741,7 +736,7 @@ mod tests {
 
     #[tokio::test]
     async fn repeated_full_name_is_collapsed() {
-        let frames = vec![
+        let frames = [
             tool_chunk(Some("list_dir"), "", 0),
             tool_chunk(Some("list_dir"), r#"{"path": "#, 0),
             tool_chunk(Some("list_dir"), r#""/""#, 0),
@@ -759,7 +754,7 @@ mod tests {
 
     #[tokio::test]
     async fn compliant_stream_passes_through() {
-        let frames = vec![
+        let frames = [
             tool_chunk(Some("list_dir"), "", 0),
             tool_chunk(None, r#"{"p":1}"#, 0),
             "data: [DONE]\n".to_string(),
@@ -771,7 +766,7 @@ mod tests {
 
     #[tokio::test]
     async fn fragment_continuation_merges_name() {
-        let frames = vec![
+        let frames = [
             tool_chunk(Some("fu"), "", 0),
             tool_chunk(Some("nc"), "", 0),
             "data: [DONE]\n".to_string(),
@@ -784,7 +779,7 @@ mod tests {
 
     #[tokio::test]
     async fn done_resets_seen_names() {
-        let frames = vec![
+        let frames = [
             tool_chunk(Some("a"), "", 0),
             "data: [DONE]\n".to_string(),
             tool_chunk(Some("b"), "", 0),
@@ -808,7 +803,7 @@ mod tests {
 
     #[tokio::test]
     async fn non_data_lines_pass_through() {
-        let frames = vec![
+        let frames = [
             ": keepalive\n".to_string(),
             "\n".to_string(),
             "data: [DONE]\n".to_string(),
@@ -820,7 +815,7 @@ mod tests {
 
     #[tokio::test]
     async fn reasoning_line_passes_through() {
-        let frames = vec![
+        let frames = [
             reasoning_chunk(),
             tool_chunk(Some("f"), "", 0),
             "data: [DONE]\n".to_string(),

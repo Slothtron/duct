@@ -561,7 +561,7 @@ async fn dispatch_forward(
 
 // ── 入口桥接（T7，设计文档 §11-R1）────────────────────────────────────
 
-/// 将「已被手工读走请求行」的连接嫁接给进程内 axum/hyper 栈。
+/// 将「已被手工读走请求行」的连接嫁接给进程内 axum/hyper 栈（薄再导出，经 `bridge.rs` 公共桥）。
 ///
 /// 预读字节先注入内部缓冲管道的一端，随后 socket 与该端双向拷贝；
 /// hyper 从另一端看到完整报文（请求行 + 余下头部/body），解析与流式语义全部由其接管。
@@ -571,27 +571,7 @@ pub async fn serve_conn_from_prelude(
     prelude: &[u8],
     client: tokio::net::TcpStream,
 ) -> anyhow::Result<()> {
-    use hyper_util::{rt::TokioIo, service::TowerToHyperService};
-    use tokio::io::{AsyncWriteExt as _, copy_bidirectional, duplex};
-
-    const BRIDGE_BUFFER: usize = 64 * 1024;
-
-    let service = TowerToHyperService::new(router(state));
-    let (mut client_half, server_half) = duplex(BRIDGE_BUFFER);
-    client_half.write_all(prelude).await?;
-
-    let conn = tokio::spawn(async move {
-        hyper::server::conn::http1::Builder::new()
-            .serve_connection(TokioIo::new(server_half), service)
-            .await
-    });
-
-    let mut client_half_ref = client_half;
-    let mut client = client;
-    let _ = copy_bidirectional(&mut client, &mut client_half_ref).await;
-    // 连接任一侧结束即收尾；hyper 连接任务随后自行终止
-    let _ = conn.await?;
-    Ok(())
+    crate::bridge::serve_conn_from_prelude(router(state), prelude, client).await
 }
 
 // ── 独立启动辅助（阶段 B 里程碑用；生产形态经 T6/T7 并入单端口）────────

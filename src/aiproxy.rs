@@ -8,8 +8,12 @@
 //! - 凭证零接触：`Authorization` / `x-api-key` 等一切头逐字节透传，不存 Key、不注入 Key
 //! - 头处理为黑名单制：仅剥离逐跳头与 `Proxy-*` 系列，其余全透传
 
-use std::time::{Duration, Instant};
-use std::{pin::Pin, sync::Arc, task::{Context as TaskContext, Poll}};
+use std::time::Duration;
+use std::{
+    pin::Pin,
+    sync::Arc,
+    task::{Context as TaskContext, Poll},
+};
 
 use axum::body::Body;
 use axum::extract::{Path, State};
@@ -18,9 +22,14 @@ use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
 use futures::Stream;
 
-use crate::config::Config;
+use crate::config::{Config, ProviderConfig};
 use crate::error::AppError;
-use crate::sse_normalize::{SseToolNormalizer, normalize_stream_field};
+use crate::sse_normalize::{SseRewindStream, SseToolNormalizer, normalize_stream_field};
+use crate::trace::{
+    EncKind, RequestTrace, RespFacts, ScannedBody, TraceSink, TracedBody, enc_kind, header_summary,
+    query_keys, url_display,
+};
+use serde_json::{Map, Value, json};
 
 /// 上游连接超时；不设整体请求超时（SSE 长流不能被总时长掐断，§6.3）。
 pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
@@ -32,10 +41,33 @@ pub struct AppState {
     pub client: reqwest::Client,
     /// 请求体上限（字节），来自 `--max-body`。
     pub max_body: usize,
+    /// 请求轨迹接收端（JSONL，参考 DSH 会话轨迹设计）；默认仅回落 tracing。
+    pub trace: Arc<TraceSink>,
+    /// `--trace-body`：>0 时轨迹记录请求/响应头部内容（字节预算），
+    /// 并协商 `accept-encoding: identity` 保证响应可读（同时使 normalize_sse 对
+    /// 压缩上游重新生效）。0 = 关闭（默认），正文永不落轨迹。
+    pub trace_body: usize,
 }
 
 impl AppState {
     pub fn new(config: Arc<Config>, max_body: usize) -> anyhow::Result<Self> {
+        Self::with_trace(config, max_body, Arc::new(TraceSink::none()))
+    }
+
+    pub fn with_trace(
+        config: Arc<Config>,
+        max_body: usize,
+        trace: Arc<TraceSink>,
+    ) -> anyhow::Result<Self> {
+        Self::with_trace_body(config, max_body, trace, 0)
+    }
+
+    pub fn with_trace_body(
+        config: Arc<Config>,
+        max_body: usize,
+        trace: Arc<TraceSink>,
+        trace_body: usize,
+    ) -> anyhow::Result<Self> {
         let client = reqwest::Client::builder()
             .connect_timeout(UPSTREAM_CONNECT_TIMEOUT)
             // 依赖集未启用任何自动解压特性，保证字节级透传语义（含 Content-Length 一致性）
@@ -44,6 +76,8 @@ impl AppState {
             config,
             client,
             max_body,
+            trace,
+            trace_body,
         })
     }
 }
@@ -138,9 +172,12 @@ where
     }
 }
 
-fn limited_body(body: Body, max_body: usize) -> reqwest::Body {
+fn limited_body<S>(body: S, max_body: usize) -> reqwest::Body
+where
+    S: Stream<Item = Result<Bytes, axum::Error>> + Unpin + Send + 'static,
+{
     reqwest::Body::wrap_stream(LimitedBody {
-        inner: body.into_data_stream(),
+        inner: body,
         remaining: max_body,
     })
 }
@@ -195,81 +232,169 @@ fn target_url(base_url: &str, rest: &str, query: Option<&str>) -> Result<reqwest
         .map_err(|e| AppError::UpstreamError(format!("invalid upstream url: {e}")))
 }
 
-async fn respond_forwarded(
-    state: &AppState,
-    method: &Method,
-    provider_base_url: &str,
-    rest: &str,
-    uri: &Uri,
+/// 入站请求部件束（axum 提取器 + 一次切分的剩余路径），收敛转发层参数表。
+struct Incoming {
+    method: Method,
+    uri: Uri,
     headers: HeaderMap,
     body: Body,
-    normalize_sse: bool,
-) -> Response {
-    let provider_id_log = uri.path().split('/').nth(2).unwrap_or("?").to_string();
+    rest: String,
+}
 
-    let url = match target_url(provider_base_url, rest, uri.query()) {
+async fn respond_forwarded(
+    state: &AppState,
+    tr: &Arc<RequestTrace>,
+    p: &ProviderConfig,
+    req: Incoming,
+) -> Response {
+    // ── request/start：轨迹自入口即有全貌（头清单先过脱敏）──
+    tr.emit(
+        "request/start",
+        json!({
+            "method": req.method.as_str(),
+            "path": req.uri.path(),
+            "query_keys": query_keys(req.uri.query()),
+            "provider": p.id,
+            "normalize_sse": p.normalize_sse,
+            "request_headers": header_summary(&req.headers),
+        }),
+    );
+
+    let url = match target_url(&p.base_url, &req.rest, req.uri.query()) {
         Ok(u) => u,
-        Err(e) => return e.into_response(),
+        Err(e) => {
+            tr.emit_with(
+                "upstream/error",
+                "error",
+                json!({"class": "bad_upstream_url", "message": e.to_string()}),
+            );
+            let (status, etype) = e.trace_identity();
+            tr.end("rejected", gateway_error(&e, status, etype));
+            return e.into_response();
+        }
     };
 
     // Content-Length 前置快路径校验（§6.5）
-    let oversized = headers
+    let oversized = req
+        .headers
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
         .and_then(|s| s.parse::<usize>().ok())
         .is_some_and(|len| len > state.max_body);
     if oversized {
-        return AppError::BodyTooLarge.into_response();
+        let err = AppError::BodyTooLarge;
+        let (status, etype) = err.trace_identity();
+        tr.end("rejected", gateway_error(&err, status, etype));
+        return err.into_response();
     }
 
-    let outgoing_headers = forward_allowed(&headers, REQUEST_HEADER_BLACKLIST);
-    let attach_body = request_has_body(method, &headers);
+    // URL 摘要剥离 userinfo 与 query 值（部分供应商在 query 携带 key）。
+    tr.emit("upstream/request", json!({"url": url_display(&url)}));
 
-    let started = Instant::now();
+    let mut outgoing_headers = forward_allowed(&req.headers, REQUEST_HEADER_BLACKLIST);
+    if state.trace_body > 0 {
+        // 内容采集开启：协商明文响应，使头部快照可读；同时令 normalize_sse
+        // 的行级改写在压缩上游上恢复有效（响应字节仍原样透传给客户端）。
+        outgoing_headers.insert(
+            axum::http::header::ACCEPT_ENCODING,
+            axum::http::HeaderValue::from_static("identity"),
+        );
+    }
+    let attach_body = request_has_body(&req.method, &req.headers);
+    let Incoming {
+        method, uri, body, ..
+    } = req;
+
     let mut send = state
         .client
         .request(method.clone(), url)
         .headers(outgoing_headers);
     if attach_body {
-        if normalize_sse {
+        if p.normalize_sse {
             // 规范化请求：读取 body（受 --max-body 约束）并补上缺失的 stream 字段，
             // 让「缺 stream 即流式」的网关对非流式请求返回合规 JSON。
             match read_and_normalize_body(body, state.max_body).await {
                 Ok(bytes) => {
+                    let mut data = crate::trace::body_facts(&bytes);
+                    data.insert("bytes".into(), json!(bytes.len()));
+                    data.insert("parse".into(), json!("full"));
+                    if state.trace_body > 0 {
+                        let head =
+                            String::from_utf8_lossy(&bytes[..bytes.len().min(state.trace_body)])
+                                .into_owned();
+                        data.insert("req_content_head".into(), json!(head));
+                    }
+                    tr.emit("request/body", Value::Object(data));
                     send = send.body(reqwest::Body::from(bytes));
                 }
-                Err(_) => return AppError::BodyTooLarge.into_response(),
+                Err(_) => {
+                    let err = AppError::BodyTooLarge;
+                    let (status, etype) = err.trace_identity();
+                    tr.end("rejected", gateway_error(&err, status, etype));
+                    return err.into_response();
+                }
             }
         } else {
-            send = send.body(limited_body(body, state.max_body));
+            // 流式透传语义不变；ScannedBody 旁路扫描前缀拿 model/stream。
+            send = send.body(limited_body(
+                ScannedBody::new(body.into_data_stream(), tr.clone(), state.trace_body),
+                state.max_body,
+            ));
         }
     }
 
     let upstream = match send.send().await {
         Ok(resp) => resp,
         Err(e) => {
-            if is_body_limit_exceeded(&e) {
-                tracing::warn!(provider = %provider_id_log, "request body exceeded --max-body mid-stream");
-                return AppError::BodyTooLarge.into_response();
-            }
-            if e.is_timeout() {
-                tracing::error!(provider = %provider_id_log, error = %e, "upstream connect timeout");
-                return AppError::UpstreamTimeout.into_response();
-            }
-            tracing::error!(provider = %provider_id_log, error = %e, "upstream connection failed");
-            return AppError::UpstreamError(e.to_string()).into_response();
+            let (class, err) = if is_body_limit_exceeded(&e) {
+                tracing::warn!(trace = %tr.trace_id, provider = %p.id, "request body exceeded --max-body mid-stream");
+                ("body_limit_exceeded", AppError::BodyTooLarge)
+            } else if e.is_timeout() {
+                tracing::error!(trace = %tr.trace_id, provider = %p.id, error = %e, "upstream connect timeout");
+                ("connect_timeout", AppError::UpstreamTimeout)
+            } else {
+                tracing::error!(trace = %tr.trace_id, provider = %p.id, error = %e, "upstream connection failed");
+                ("connect_failed", AppError::UpstreamError(e.to_string()))
+            };
+            tr.emit_with(
+                "upstream/error",
+                "error",
+                json!({"class": class, "message": e.to_string()}),
+            );
+            let (status, etype) = err.trace_identity();
+            let outcome = if matches!(err, AppError::BodyTooLarge) {
+                "rejected"
+            } else {
+                "upstream_error"
+            };
+            tr.end(outcome, gateway_error(&err, status, etype));
+            return err.into_response();
         }
     };
 
     let status = upstream.status();
     let response_headers = forward_allowed(upstream.headers(), RESPONSE_HEADER_BLACKLIST);
+    let ttfb_ms = tr.elapsed_ms();
+    tr.set_resp(RespFacts {
+        status: status.as_u16(),
+        ttfb_ms,
+    });
+    tr.emit(
+        "upstream/response",
+        json!({
+            "status": status.as_u16(),
+            "ttfb_ms": ttfb_ms,
+            "response_headers": header_summary(upstream.headers()),
+        }),
+    );
 
     tracing::info!(
-        provider = %provider_id_log,
+        trace = %tr.trace_id,
+        provider = %p.id,
         method = %method,
         path = %uri.path(),
         status = %status,
-        elapsed_ms = started.elapsed().as_millis() as u64,
+        elapsed_ms = ttfb_ms,
         "aiproxy forwarded"
     );
 
@@ -280,22 +405,71 @@ async fn respond_forwarded(
         .unwrap_or("")
         .to_string();
 
-    let stream = upstream.bytes_stream();
+    // 观测在最内层：TracedBody 看到的是上游原始字节（normalizer 改写之前），
+    // 且 request/end 在流被完整消费/出错/提前 Drop 时由它补发。
+    let is_sse = upstream_ct.starts_with("text/event-stream");
+    // 上游若回压缩流（gzip/deflate/br），透传字节不解帧；TracedBody 对可识别
+    // 编码走观察式解码提取事实（`sse.encoded+decoded`），未知编码保留标记。
+    let upstream_encoding = upstream
+        .headers()
+        .get(axum::http::header::CONTENT_ENCODING)
+        .and_then(|v| v.to_str().ok())
+        .filter(|v| !v.eq_ignore_ascii_case("identity") && !v.is_empty())
+        .map(str::to_string);
+    let traced = TracedBody::new(
+        upstream.bytes_stream(),
+        tr.clone(),
+        is_sse,
+        upstream_encoding.as_deref(),
+        state.trace_body,
+    );
+    // 工具名归一化仅在「开启 normalize_sse 且上游返回 SSE」时生效。
+    // 上游恒压缩且不理会 identity 协商（kso 实测）时，gzip/deflate 走
+    // 「解码→改写→明文重发」（并剥掉 content-encoding 头）；br 无 poll 内
+    // 增量解码，退回压缩透传并 WARN 说明改写失效。
+    let rewind_kind = if p.normalize_sse && is_sse {
+        upstream_encoding.as_deref().and_then(enc_kind)
+    } else {
+        None
+    };
+    let mut response_headers = response_headers;
+    let body = if p.normalize_sse && is_sse {
+        match rewind_kind {
+            Some(kind @ (EncKind::Gzip | EncKind::Deflate)) => {
+                response_headers.remove(axum::http::header::CONTENT_ENCODING);
+                tracing::debug!(trace = %tr.trace_id, provider = %p.id, encoding = %upstream_encoding.as_deref().unwrap_or_default(), "sse-normalize: decode + rewrite, re-emitting identity");
+                Body::from_stream(SseRewindStream::new(traced, kind))
+            }
+            Some(EncKind::Br) => {
+                tracing::warn!(trace = %tr.trace_id, provider = %p.id, "sse-normalize: brotli stream cannot be rewritten in-stream; relaying compressed passthrough");
+                Body::from_stream(traced)
+            }
+            None => {
+                tracing::debug!(trace = %tr.trace_id, provider = %p.id, "sse-normalize: wrapping upstream event-stream with SseToolNormalizer");
+                Body::from_stream(SseToolNormalizer::new(traced))
+            }
+        }
+    } else {
+        Body::from_stream(traced)
+    };
     let mut builder = Response::builder().status(status.as_u16());
     for (name, value) in &response_headers {
         builder = builder.header(name, value);
     }
-    // 工具名归一化仅在「开启 normalize_sse 且上游返回 SSE」时生效；
-    // 其余情况维持现有逐字节透传。
-    let body = if normalize_sse && upstream_ct.starts_with("text/event-stream") {
-        tracing::debug!(provider = %provider_id_log, "sse-normalize: wrapping upstream event-stream with SseToolNormalizer");
-        Body::from_stream(SseToolNormalizer::new(stream))
-    } else {
-        Body::from_stream(stream)
-    };
     builder
         .body(body)
+        // tap 的 Drop 兜底会为这条被丢弃的响应写出 request/end{interrupted}。
         .unwrap_or_else(|e| AppError::UpstreamError(e.to_string()).into_response())
+}
+
+/// 网关自身产生的错误映射为 `request/end` 的 `gateway_error` 对象。
+fn gateway_error(err: &AppError, status: u16, etype: &'static str) -> Map<String, Value> {
+    let mut m = Map::new();
+    m.insert(
+        "gateway_error".into(),
+        json!({"message": err.to_string(), "type": etype, "status": status}),
+    );
+    m
 }
 
 /// 读取请求体(受 `--max-body` 约束)并对缺失的 `stream` 字段做归一化。
@@ -325,7 +499,7 @@ async fn forward_root(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    dispatch_forward(state, provider, "", method, uri, headers, body).await
+    dispatch_forward(state, provider, String::new(), method, uri, headers, body).await
 }
 
 /// `/aiproxy/{provider}/{*rest}` —— 一次切分后整段透传。
@@ -337,33 +511,50 @@ async fn forward(
     headers: HeaderMap,
     body: Body,
 ) -> Response {
-    dispatch_forward(state, provider, &rest, method, uri, headers, body).await
+    dispatch_forward(state, provider, rest, method, uri, headers, body).await
 }
 
 async fn dispatch_forward(
     state: AppState,
     provider: String,
-    rest: &str,
+    rest: String,
     method: Method,
     uri: Uri,
     headers: HeaderMap,
     body: Body,
 ) -> Response {
+    let tr = RequestTrace::new(state.trace.clone());
     let Some(p) = state.config.get(&provider) else {
-        tracing::debug!(provider = %provider, path = %uri.path(), "aiproxy provider miss");
-        return provider_not_found(&provider, &state.config).into_response();
+        tracing::debug!(trace = %tr.trace_id, provider = %provider, path = %uri.path(), "aiproxy provider miss");
+        // 未注册 provider 也成轨迹：start + end 成对，404 根因可回放。
+        tr.emit(
+            "request/start",
+            json!({
+                "method": method.as_str(),
+                "path": uri.path(),
+                "query_keys": query_keys(uri.query()),
+                "provider": provider,
+                "known": false,
+                "available": state.config.provider_ids(),
+                "request_headers": header_summary(&headers),
+            }),
+        );
+        let err = provider_not_found(&provider, &state.config);
+        let (status, etype) = err.trace_identity();
+        tr.end("rejected", gateway_error(&err, status, etype));
+        return err.into_response();
     };
-    let base_url = p.base_url.clone();
-    let normalize_sse = p.normalize_sse;
     respond_forwarded(
         &state,
-        &method,
-        &base_url,
-        rest,
-        &uri,
-        headers,
-        body,
-        normalize_sse,
+        &tr,
+        p,
+        Incoming {
+            method,
+            uri,
+            headers,
+            body,
+            rest,
+        },
     )
     .await
 }
@@ -428,9 +619,16 @@ mod tests {
 
     #[test]
     fn target_url_joins_rest_and_query() {
-        let url = target_url("https://api.openai.com/v1", "chat/completions", Some("k=1&a=b"))
-            .unwrap();
-        assert_eq!(url.as_str(), "https://api.openai.com/v1/chat/completions?k=1&a=b");
+        let url = target_url(
+            "https://api.openai.com/v1",
+            "chat/completions",
+            Some("k=1&a=b"),
+        )
+        .unwrap();
+        assert_eq!(
+            url.as_str(),
+            "https://api.openai.com/v1/chat/completions?k=1&a=b"
+        );
     }
 
     #[test]

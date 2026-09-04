@@ -6,7 +6,11 @@ use std::os::unix::process::CommandExt;
 use duct::auth::AuthConfig;
 
 #[derive(Parser, Debug)]
-#[command(name = "duct", version, about = "Lightweight HTTP/HTTPS proxy with process name disguise")]
+#[command(
+    name = "duct",
+    version,
+    about = "Lightweight HTTP/HTTPS proxy with process name disguise"
+)]
 struct Cli {
     /// Listening port
     #[arg(short, long, default_value_t = 11088)]
@@ -46,6 +50,26 @@ struct Cli {
     /// Maximum request body size in bytes forwarded by aiproxy.
     #[arg(long, default_value_t = 16 * 1024 * 1024)]
     max_body: usize,
+
+    /// JSONL request-trace file for aiproxy (append-only, one event per line,
+    /// modeled on the DSH session-trace design). Defaults to the XDG state dir
+    /// $XDG_STATE_HOME/duct/trace.jsonl (usually ~/.local/state/duct/trace.jsonl).
+    /// "~" is expanded; an empty value disables the file sink and trace events
+    /// fall back to tracing (target=duct::trace). Credentials are always
+    /// redacted to `***`. Missing files and parent dirs are created; runtime
+    /// deletion/rotation is self-healed. If unopenable, duct warns and continues.
+    #[arg(long, value_name = "PATH")]
+    trace_file: Option<String>,
+
+    /// Opt-in content capture. When > 0, the trace also records a head snapshot
+    /// of the request body and response stream (this byte budget) as
+    /// `req_content_head` / `resp_content_head` — prompts and completions then
+    /// DO land on disk, so treat the trace file as sensitive (chmod 600).
+    /// Also sends `Accept-Encoding: identity` upstream (response bytes are still
+    /// relayed verbatim), which makes provider `normalize_sse` effective again
+    /// against compressing gateways. 0 (default) = never capture content.
+    #[arg(long, default_value_t = 0, value_name = "BYTES")]
+    trace_body: usize,
 }
 
 #[tokio::main]
@@ -55,13 +79,10 @@ async fn main() -> anyhow::Result<()> {
     // Construct auth config from CLI args or environment variables.
     // clap's `requires` ensures both --user and --passwd (or their env counterparts)
     // are provided together, or neither is provided.
-    let auth = cli
-        .user
-        .zip(cli.passwd)
-        .map(|(user, passwd)| AuthConfig {
-            username: user,
-            password: passwd,
-        });
+    let auth = cli.user.zip(cli.passwd).map(|(user, passwd)| AuthConfig {
+        username: user,
+        password: passwd,
+    });
 
     // ── Process name disguise (opt-in) ──
     // Some environments filter TCP connections by the originating process name
@@ -73,17 +94,20 @@ async fn main() -> anyhow::Result<()> {
         // Filter out --disguise (and its value) from args to prevent infinite re-exec
         let filtered_args: Vec<_> = {
             let mut skip_next = false;
-            env::args_os().skip(1).filter(|a| {
-                if skip_next {
-                    skip_next = false;
-                    return false;
-                }
-                if a == "--disguise" {
-                    skip_next = true;
-                    return false;
-                }
-                true
-            }).collect()
+            env::args_os()
+                .skip(1)
+                .filter(|a| {
+                    if skip_next {
+                        skip_next = false;
+                        return false;
+                    }
+                    if a == "--disguise" {
+                        skip_next = true;
+                        return false;
+                    }
+                    true
+                })
+                .collect()
         };
 
         tracing::info!(%disguise, "re-execing with disguised process name");
@@ -101,8 +125,7 @@ async fn main() -> anyhow::Result<()> {
     };
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| filter.into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| filter.into()),
         )
         .init();
 
@@ -136,11 +159,58 @@ async fn main() -> anyhow::Result<()> {
         },
     };
 
-    let state = duct::aiproxy::AppState::new(std::sync::Arc::new(config), cli.max_body)
-        .context("构建 aiproxy 状态失败")?;
+    // ── 请求轨迹 sink（JSONL，参考 DSH 会话轨迹设计）；打开失败降级为 tracing-only ──
+    let trace_sink = match cli.trace_file.as_deref() {
+        Some(s) if s.trim().is_empty() => {
+            tracing::info!(
+                "aiproxy trace file disabled (trace events -> tracing target duct::trace)"
+            );
+            std::sync::Arc::new(duct::trace::TraceSink::none())
+        }
+        specified => {
+            // 未指定时用 XDG 状态目录默认值；指定值做 ~ 展开。
+            let path = match specified {
+                Some(s) => expand_tilde(s),
+                None => duct::trace::default_trace_path(),
+            };
+            match duct::trace::TraceSink::to_file(&path) {
+                Ok(sink) => std::sync::Arc::new(sink),
+                Err(e) => {
+                    tracing::warn!(error = %e, file = %path.display(), "aiproxy 轨迹文件不可用，降级为 tracing 输出");
+                    std::sync::Arc::new(duct::trace::TraceSink::none())
+                }
+            }
+        }
+    };
+
+    let state = duct::aiproxy::AppState::with_trace_body(
+        std::sync::Arc::new(config),
+        cli.max_body,
+        trace_sink,
+        cli.trace_body,
+    )
+    .context("构建 aiproxy 状态失败")?;
+
+    if cli.trace_body > 0 {
+        tracing::warn!(
+            bytes = cli.trace_body,
+            "trace content capture ON: prompts/completions land in trace file; protect it like a key"
+        );
+    }
 
     tracing::info!(%addr, auth = auth.is_some(), "starting duct");
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     duct::server::run_with_aiproxy_from_listener(listener, auth, state).await
+}
+
+/// 展开开头的 `~` 为 $HOME（无 HOME 时保持原样，由上层报错/降级）。
+fn expand_tilde(s: &str) -> std::path::PathBuf {
+    let home = || env::var_os("HOME").map(std::path::PathBuf::from);
+    match s {
+        "~" => home(),
+        _ if s.len() > 1 && s.as_bytes()[1] == b'/' => home().map(|h| h.join(&s[2..])),
+        _ => None,
+    }
+    .unwrap_or_else(|| std::path::PathBuf::from(s))
 }

@@ -357,3 +357,31 @@ kso 也重复下发 `id`。`id` 是常量，累加/覆盖下游都不会错（�
 3. 是否按 provider 粒度开启（推荐），还是全局开关。
 4. `MAX_LINE` 防御上限的取值与超限降级策略是否可接受。
 5. 该方案与消费端自身放大器（非目标 §2.2）之间的边界是否清晰。
+
+
+---
+
+## 增补：压缩上游上的失效与 decode→rewrite→re-emit 路径（实施记录）
+
+**线上定性（经 aiproxy 轨迹采集取证）**：kso 网关的工具名重发违规发生在**响应侧
+SSE 流**（每个 tool-call chunk 重复完整 `function.name`），与客户端请求无关——
+轨迹显示请求侧工具回环完全正常（`last_role=tool` 连续推进、`finish_reason:tool_calls`
+→结果回传→`stop` 收尾），且 kso **无视 `Accept-Encoding: identity` 协商恒发 gzip**
+（直连探测：`accept-encoding: identity` 仍回 `content-encoding: gzip`）。
+
+由此暴露原实现的空洞：`SseToolNormalizer` 是明文字节上的行改写器，压缩流里没有
+`data:` 行可匹配，**normalize_sse 在 kso 上自上线起一直静默空转**，重复名原样漏给
+客户端。
+
+**修复形态**（`SseRewindStream`，src/sse_normalize.rs）：
+- 压缩 SSE + normalize_sse → 流式 inflate（gzip 头手工剥离 + flate2 rust_backend
+  增量 inflate；HTTP deflate 的 zlib/raw 二义性由魔数探测一次性判定）→
+  `ToolNameRewriter`（从 normalizer 抽出的共享行改写状态机）→ **以明文重发**，
+  响应头剥掉 `content-encoding`；
+- 透传语义的偏离由 provider 显式声明的 `normalize_sse` 授权（该选项本意即
+  「我会改写你的流」）；
+- brotli 无 poll 内增量解码 API → 退回压缩透传 + WARN（kso 实测为 gzip，不受影响）；
+- 解码失败（坏帧/字典/超长头）→ 流以 Err 终止，已改写行先出。
+
+观察解码（trace 侧收尾一次性全量解，含 br）与本路径（poll 内流式，仅 gzip/deflate）
+是两个独立机制，共用 `EncKind` 解析。

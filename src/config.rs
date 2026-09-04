@@ -24,8 +24,11 @@ pub struct ProviderConfig {
     /// 开启后：
     /// - 请求：若 body 为 JSON 对象且缺少 `stream`，显式注入 `"stream": false`
     ///   （规避把「缺 stream」当作默认流式的网关，如 kso）；
-    /// - 响应：上游为 text/event-stream 时，用 `SseToolNormalizer` 改写
-    ///   重复下发/片段续写的 `function.name` 为合规流。
+    /// - 响应：上游为 text/event-stream 时改写重复下发/片段续写的
+    ///   `function.name` 为合规流。明文流经 `SseToolNormalizer` 原地改写；
+    ///   gzip/deflate 压缩流（kso 无视 identity 协商恒发 gzip）经
+    ///   `SseRewindStream` 解码→改写→以明文重发（剥 content-encoding 头）；
+    ///   brotli 无法在 poll 内增量解码，退回压缩透传并 WARN。
     pub normalize_sse: bool,
 }
 
@@ -74,11 +77,17 @@ impl Config {
 
 /// 默认配置路径：`$XDG_CONFIG_HOME/duct/config.yaml` 或 `~/.config/duct/config.yaml`。
 pub fn default_config_path() -> PathBuf {
-    if let Some(dir) = std::env::var("XDG_CONFIG_HOME").ok().filter(|d| !d.is_empty()) {
+    if let Some(dir) = std::env::var("XDG_CONFIG_HOME")
+        .ok()
+        .filter(|d| !d.is_empty())
+    {
         return PathBuf::from(dir).join("duct").join("config.yaml");
     }
     if let Some(home) = std::env::var("HOME").ok().filter(|h| !h.is_empty()) {
-        return PathBuf::from(home).join(".config").join("duct").join("config.yaml");
+        return PathBuf::from(home)
+            .join(".config")
+            .join("duct")
+            .join("config.yaml");
     }
     PathBuf::from("config.yaml")
 }
@@ -114,12 +123,10 @@ fn normalize_base_url(raw: &str, id: &str) -> Result<String> {
 /// 以 `serde_yaml::Value` 中转而非直接反序列化到结构体，
 /// 以获得重复 id 检测与逐条目错误定位能力。
 fn parse_str(content: &str, source: &Path) -> Result<Config> {
-    let value: serde_yaml::Value =
-        serde_yaml::from_str(content).with_context(|| format!("解析配置失败: {}", source.display()))?;
+    let value: serde_yaml::Value = serde_yaml::from_str(content)
+        .with_context(|| format!("解析配置失败: {}", source.display()))?;
 
-    let providers_value = value
-        .get("providers")
-        .context("配置缺少 'providers' 段")?;
+    let providers_value = value.get("providers").context("配置缺少 'providers' 段")?;
     let mapping = providers_value
         .as_mapping()
         .context("'providers' 段必须是映射（id → {url}）")?;
@@ -202,7 +209,10 @@ providers:
         .unwrap();
         assert_eq!(cfg.len(), 2);
         // 尾斜杠归一化
-        assert_eq!(cfg.get("openai").unwrap().base_url, "https://api.openai.com/v1");
+        assert_eq!(
+            cfg.get("openai").unwrap().base_url,
+            "https://api.openai.com/v1"
+        );
         assert_eq!(cfg.get("ollama").unwrap().base_url, "http://ollama:11434");
         // 保持声明顺序
         assert_eq!(cfg.provider_ids(), vec!["openai", "ollama"]);

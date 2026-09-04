@@ -4,9 +4,9 @@
 //! `{"error":{"message":"...","type":"..."}}`
 //! 上游返回的错误状态**原样透传**，不在网关伪造 OpenAI 语义。
 
+use axum::Json;
 use axum::http::StatusCode;
 use axum::response::{IntoResponse, Response};
-use axum::Json;
 use serde::Serialize;
 
 #[derive(Debug, Clone, thiserror::Error)]
@@ -63,6 +63,12 @@ impl AppError {
     pub fn status(&self) -> StatusCode {
         self.status_and_type().0
     }
+
+    /// 供请求轨迹记录：(HTTP 状态码, OpenAI 兼容错误类型)。
+    pub fn trace_identity(&self) -> (u16, &'static str) {
+        let (status, error_type) = self.status_and_type();
+        (status.as_u16(), error_type)
+    }
 }
 
 impl IntoResponse for AppError {
@@ -97,7 +103,9 @@ mod tests {
             .await
             .unwrap();
         let status = resp.status();
-        let body = axum::body::to_bytes(resp.into_body(), 1 << 20).await.unwrap();
+        let body = axum::body::to_bytes(resp.into_body(), 1 << 20)
+            .await
+            .unwrap();
         (status, serde_json::from_slice(&body).unwrap())
     }
 
@@ -110,10 +118,12 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::NOT_FOUND);
         assert_eq!(json["error"]["type"], "invalid_request_error");
-        assert!(json["error"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("openai, ollama"));
+        assert!(
+            json["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("openai, ollama")
+        );
     }
 
     #[test]
@@ -123,7 +133,10 @@ mod tests {
 
     #[test]
     fn body_too_large_maps_to_413() {
-        assert_eq!(AppError::BodyTooLarge.status(), StatusCode::PAYLOAD_TOO_LARGE);
+        assert_eq!(
+            AppError::BodyTooLarge.status(),
+            StatusCode::PAYLOAD_TOO_LARGE
+        );
     }
 
     #[tokio::test]

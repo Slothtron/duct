@@ -62,6 +62,23 @@ ExecStart=/usr/local/bin/duct \
 #     --port 11088 \
 #     --config-file /etc/duct/config.yaml
 
+# aiproxy 请求轨迹（JSONL 事件链，排查 AI 转发问题用；凭证与 prompt 正文永不落轨迹）：
+#   默认路径 ~/.local/state/duct/trace.jsonl 在 ProtectHome=yes 下不可达——
+#   duct 会 WARN 并自动降级为 tracing 输出（journald 里 target=duct::trace），不致命。
+#   要保留独立文件，指到状态目录并授权：
+#     StateDirectory=duct
+#     ExecStart=/usr/local/bin/duct --bind 0.0.0.0 --port 11088 \
+#         --trace-file /var/lib/duct/trace.jsonl
+#   （user unit 场景：StateDirectory=duct 映射到 ~/.local/state/duct 且 systemd 会
+#     导出 XDG_STATE_HOME，此后连 --trace-file 都可以省略，默认值即命中例外目录。）
+#   事件词表与 jq 排查配方见 docs/aiproxy-trace.md
+#   ⚠️ 如需排查对话内容本身，可加 --trace-body <bytes>（请求/响应头部快照进轨迹）；
+#      届时 prompt 全文将落盘，请把轨迹文件按敏感数据管理：
+#      chmod 600 + 收紧 logrotate 保留份数。凭证头不受此开关影响，永远 ***。
+#   轨迹文件缺失会自动创建，运行期被删/被轮转亦自愈，logrotate 用 create 或
+#   copytruncate 模式均可（推荐 /etc/logrotate.d/duct）：
+#     /var/lib/duct/trace.jsonl { weekly rotate 8 compress missingok }
+
 # 注：凭据通过 EnvironmentFile 中的 DUCT_USER / DUCT_PASSWD 传入
 # 不在 argv 中，ps -ef 不可见
 

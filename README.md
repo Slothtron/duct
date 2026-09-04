@@ -7,12 +7,13 @@
 - **HTTP CONNECT 隧道代理**：支持 HTTPS 流量的透明转发
 - **HTTP 正向代理**：支持浏览器插件模式（如 SwitchyOmega）的 HTTP 请求转发
 - **AI 转发反向代理（aiproxy）**：`/aiproxy/{provider}/*` 按路径前缀转发至预配置上游，YAML 声明式 provider 清单，凭证零接触（不存 Key、不注入 Key），SSE 流式透传
+- **aiproxy 请求轨迹（trace）**：参考 DSH 会话轨迹的事件溯源设计，每次转发落一条 JSONL 事件链（`request/start → request/body → upstream/response → request/end`），记录 model/stream、TTFB、token usage、finish_reason、流完整性与失败归因；凭证与 prompt 正文强制不进轨迹。详见 [docs/aiproxy-trace.md](docs/aiproxy-trace.md)
 - **探活端点**：`GET /healthz` 进程级判活，独立于任何配置状态
 - **单端口五路分流**：同一监听端口按请求行形状区分 CONNECT / 正向代理 / aiproxy / healthz
 - **HTTP Basic 认证**：保护 CONNECT 与正向代理分支（通过 `--user` / `--passwd` 或 `DUCT_USER` / `DUCT_PASSWD`）
 - **进程名伪装**：通过 `--disguise` 指定进程名，绕过基于 argv[0] 的访问控制
 - **高性能**：基于 Rust + tokio 异步运行时，单二进制部署
-- **完整测试覆盖**：44 个单元测试 + 33 个集成测试（含桥接长头部专项）
+- **完整测试覆盖**：74 个单元测试 + 45 个集成测试（含桥接长头部专项与轨迹全链路断言）
 
 ## 安装
 
@@ -127,15 +128,53 @@ OpenAI(base_url="http://127.0.0.1:11088/aiproxy/openai/v1", api_key=真实key)
 - 未注册 provider → 404 OpenAI 兼容 JSON 错误；请求体超过 `--max-body`（默认 16 MiB）→ 413
 - ⚠️ **无鉴权设计**：信任边界 = 内网/防火墙边界，请勿暴露公网
 - 探活：`curl http://127.0.0.1:11088/healthz`（进程级判活，任何配置状态下均可用）
+- 每一次转发都可落一条 JSONL 请求轨迹（见下节），SSE 流同样有始有终
+
+### AI 转发请求轨迹（排查入口）
+
+参考 deepseek-harness 会话轨迹的事件溯源设计：一次转发 = 一条 append-only 事件链，
+信封 `{v, time, trace, seq, type, severity, data}`，`request/end` 唯一收尾
+（`completed / rejected / upstream_error / stream_error / interrupted`）。
+
+```bash
+# 默认即启用，落 $XDG_STATE_HOME/duct/trace.jsonl（未设则 ~/.local/state/duct/trace.jsonl）；显式指定：
+duct --trace-file /var/log/duct/trace.jsonl
+# 关闭文件 sink（事件回落 tracing，target=duct::trace）：
+duct --trace-file ""
+```
+
+> 轨迹文件缺失会自动创建（含父目录链）；运行期被外部删除或被 logrotate
+> `create`/`move`/`copytruncate` 换走 inode 时，writer 会在下一条记录前自动重建续写。
+
+每条请求至少回答：谁转给了哪个 provider、什么模型、是否流式、上游多久应答（TTFB）、
+回了什么状态、流是否走完（`[DONE]`）、token 用量与停止原因、失败卡在哪一段：
+
+```bash
+TR=~/.local/state/duct/trace.jsonl
+tail -n 200 $TR | jq -s 'group_by(.trace) | last | sort_by(.seq)'          # 最近一次请求全貌
+jq -c 'select(.type=="request/end" and .severity!="info")' $TR               # 只看异常收尾
+jq -c 'select(.data.sse.done==false)' $TR                                    # 被截断的流
+```
+
+**凭证零接触在日志侧同步强制**：`authorization` / `x-api-key` 等只记 `名字:***`，
+prompt 与补全正文默认不落盘（只留 model/usage/finish_reason 等派生事实）。
+需要看内容本身时显式开采集：`--trace-body 2048` 会把请求/响应头部快照记入轨迹
+（轨迹文件随之含 prompt，按敏感文件管理；同时对上游协商明文）。即便网关（如 kso）
+无视协商仍回压缩流：轨迹侧做**观察式解码**恢复 usage/finish_reason/内容快照
+（`sse.encoded+decoded`）；开了 `normalize_sse` 的 provider 则走
+**解码→改写→明文重发**，工具名归一化对压缩流同样生效（brotli 除外，退回透传并 WARN）。
+事件词表、severity 映射与排查配方见 [docs/aiproxy-trace.md](docs/aiproxy-trace.md)。
 
 ## 架构
 
 ```
 src/
-├── main.rs      # CLI 入口 + 配置装载 + 进程名伪装 + tracing
+├── main.rs      # CLI 入口 + 配置装载 + 进程名伪装 + tracing + trace sink 接线
 ├── server.rs    # TCP 接收循环 + 五分支分流（healthz / aiproxy / CONNECT / 正向代理）+ 认证检查
 ├── connect.rs   # CONNECT 隧道逻辑 + 请求解析 + HTTP 转发
-├── aiproxy.rs   # /aiproxy 反向代理：路由/头处理/流式转发 + 入口桥接
+├── aiproxy.rs   # /aiproxy 反向代理：路由/头处理/流式转发 + 轨迹埋点 + 入口桥接
+├── trace.rs     # aiproxy 请求轨迹：JSONL 事件溯源 + sink（文件/tracing/内存）+ 脱敏 + 流观测 tap
+├── sse_normalize.rs # SSE 流兼容归一化（stream 字段注入 + 工具名去重）
 ├── config.rs    # config.yaml 装载（三层语义：缺省禁用/损坏致命/条目跳过）
 ├── error.rs     # OpenAI 兼容错误响应
 ├── auth.rs      # HTTP Basic 认证检查 + base64 解码
@@ -179,6 +218,11 @@ Options:
       --config-file <PATH>    aiproxy provider 配置（YAML）路径
                               [默认 ~/.config/duct/config.yaml；缺省文件存在则启用，不存在则禁用 aiproxy]
       --max-body <BYTES>      aiproxy 请求体上限 [default: 16777216]
+      --trace-file <PATH>     aiproxy 请求轨迹 JSONL 路径（append-only）
+                              [默认 $XDG_STATE_HOME/duct/trace.jsonl，即 ~/.local/state/...；
+                               空串关闭文件 sink，事件回落 tracing]
+      --trace-body <BYTES>    轨迹内容采集预算（默认 0=不采集正文）；>0 时记录
+                              请求/响应头部快照，并对上游协商 Accept-Encoding: identity
   -V, --version               版本信息
   -h, --help                  帮助信息
       --disguise <NAME>       进程伪装名称（可选，默认不启用）
@@ -208,6 +252,22 @@ RUST_LOG=debug duct -v
 ```
 
 ## 故障排查
+
+### 问题：AI 转发结果不符合预期（慢、断流、报错、计费异常）
+
+**入口：** 查 `~/.local/state/duct/trace.jsonl`（或 `--trace-file` 指定路径），按
+`trace` 字段串起一次请求的完整事件链，再按 `request/end` 的 `outcome` 定位断点：
+
+| 现象 | 轨迹特征 |
+|---|---|
+| 上游不可达 / 连接超时 | `upstream/error{class:connect_timeout\|connect_failed}` + `request/end{upstream_error}` |
+| 客户端断连 / 流被取消 | `request/end{outcome:"interrupted"}`（Drop 兜底合成） |
+| SSE 中途断 | `request/end{outcome:"stream_error"}` 或 `sse.done:false` |
+| 上游 4xx/5xx | `request/end{completed, status>=400, resp_preview}`（错误体截断预览） |
+| 限流 | `status:429` + `response_headers` 中的 `retry-after:*` |
+| token 用量核对 | `request/end.sse.usage`（SSE 尾帧）或 `body.usage`（非流式） |
+
+更多 jq 配方见 [docs/aiproxy-trace.md](docs/aiproxy-trace.md#排查配方-jq)。
 
 ### 问题：上游连接超时
 

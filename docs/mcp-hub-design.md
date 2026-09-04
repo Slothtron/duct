@@ -1,6 +1,6 @@
 # duct MCP 聚合网关（mcp hub）调研与设计方案
 
-> 状态: **设计 v5（未实现）**。范围建议：**一期只做 tools 聚合（list + call）+ hub 鉴权**，resources/prompts/通知流/反向请求中继进二期。
+> 状态: **设计 v6（未实现）**。范围建议：**一期只做 tools 聚合（list + call）+ hub 鉴权**，resources/prompts/通知流/反向请求中继进二期。
 > **修订记录**:
 > - v1: 初版设计稿（端点 `/mcp/hub` + 子集白名单形态）。
 > - v2: **评审落地三项决策**——① 形态定为 **duct 内建**（§4 方案 A）；② 端点定为**顶层固定路径 `/mcphub`**
@@ -24,6 +24,12 @@
 >   header 名留在配置里可审计，`"Bearer ${T}"` 前缀+密钥混排天然支持）；
 >   配套：变量缺失 fail-safe（token 条目跳过 / credentials 整条摘除该 server）、含凭证配置结构
 >   `Debug` 脱敏硬约束（防 dump 泄漏，K6 锁）。
+> - v6: **评审落地三项**——① **Q14 鉴权强制化**：hub 启用即必须鉴权，`hub.auth` 缺段 / `tokens`
+>   缺省 / 空 / 全部无有效值 → **启动致命（拒绝启动，报配置错误）**；`auth.enabled` 键废止（不提供
+>   "关鉴权跑 hub" 的选项，fail-closed 成为唯一形态）；② **Q12 定为静态 token**：动态签发端点
+>   （`POST /mcphub/token`，原 T14）取消——吊销 = 删条目重启；若未来需要限时凭证，届时另议；
+>   ③ **Q3 命名方案定稿**：恒前缀 `{server}__{tool}` + `_meta.hub` 附原值 + `__` 固定分隔符
+>   + 注入性 id 自动摘除（§5.4）。
 > 定位变化: 这是 duct **第一个需要「理解 MCP 协议 envelope」的组件**——正是 `mcp-forwarding-design.md` §2.4
 > 判过「与轻量中转定位冲突、列入非目标、如未来需要单独立项」的 **D 方案（聚合网关）**。本文即该立项的设计稿。
 > 关联: `docs/mcp-forwarding-design.md`（A 方案已落地 `feat/mcp-forwarding`，本方案复用其传输底座与配置体系）、
@@ -52,6 +58,7 @@
 客户端凭证头照旧原样透传（A 语义零变化）。
 ⑥ **（v5）凭证 env 读取**：hub 出入站凭证（token 与后端 header 值）统一支持 **`${VAR}` 环境变量 KEY 读取**，
 装载时解析，密钥值不落配置文件。
+⑦ **（v6）鉴权强制**：hub 启用即必须鉴权——没配 token 就不许启动（fail-closed），聚合面不存在"裸奔"形态。
 对应设计落点：§4-Q1 / §5.1-Q9 / §5.2-Q2 / §5.8-Q10~Q14。
 
 ### 1.2 目标形态
@@ -109,6 +116,8 @@ result.tools 条目名），其余字节（arguments、content 数组、错误�
 | resources/*、prompts/* 聚合 | 二期。后端 capabilities 含 resources/prompts 时，一期**不声明、不聚合**，工具面保持完整即可用；配置 `include_*` 预留 |
 | 服务端主动通知流（客户端 GET /mcphub 长挂） | 一期回 **405**（spec 允许，等价于「无 server→client 主动消息能力」）。代价：`tools/list_changed`、跨请求 progress、后端 GET 流事件一期不透传 |
 | sampling / elicitation / roots 等 **server→client 反向请求** | 一期不中继：出现在后端 POST 响应流里的反向请求帧 → hub 代答 JSON-RPC error（`-32601`, "gateway does not relay server-to-client requests"）+ WARN，其余帧正常透传（§5.6）。完整中继需 id 翻译表，二期 |
+| 鉴权动态签发/限时 token/分钟级吊销 | **v6 已裁（Q12）**：静态 token 表 + 删条目重启即吊销；动态签发端点废止（T14 作废）。真出现时效需求另立评审 |
+| 鉴权失败限速/账号锁定 | 一期不做，失败计数 + WARN 审计（trace `rejected`）；限速/backoff 列 T15（§5.8.3） |
 | 多实例/会话粘性/跨进程共享会话 | 不做，文档声明单实例 |
 | stdio / 遗留 SSE 后端 | 沿用 A 的结论：经 supergateway 转 Streamable HTTP 再纳入聚合，hub 不内建托管 |
 | 跨客户端共享后端会话（省连接的 pooled 模式） | 一期不做（会话语义隔离优先；v3 后凭证模型已不阻碍，属可解锁项），列为演进选项（§5.3 M2） |
@@ -176,8 +185,7 @@ mcp:
     internal: { url: http://mcp.corp:9000/mcp, origin_policy: upstream }
   hub:                           # 新增可选段；缺省 = hub 不启用
     enabled: true
-    auth:                        # v3：客户端侧统一鉴权（缺段 = 不鉴权，与 duct 无鉴权传统一致）
-      enabled: true
+    auth:                        # v6：hub 启用即必须鉴权（无关闭选项；缺 tokens = 启动失败）
       tokens:
         - label: laptop                 # trace 审计标识（不涉密）
           token: "${DUCT_HUB_TK_LAPTOP}"   # v5：值级 env 引用（生成建议：openssl rand -hex 32）
@@ -206,8 +214,9 @@ mcp:
 3. 单射性约束（v2 精化）：server id 含 `separator`（`__`）会破坏前缀反解（§5.4）→ 该条目**自动降级为
    `hub: false` + WARN**，不再整条跳过——透明转发不受牵连，故障半径与开关语义对齐。
 4. 端点固定 `/mcphub`：与 server id 命名空间不相交，v1 的 "path 首段保留" 规则**删除**；`path` 键随之移除（不再可配置）。
-5. **auth fail-closed（v3）**：`hub.auth.enabled: true` 而 `tokens` 缺省/为空/全部无有效值 →
-   **文件级错误拒绝启动**（"开了鉴权却无可用凭证"比无鉴权更危险，不静默放行也不静默锁死）。
+5. **auth 强制 fail-closed（v6 决策 Q14）**：`mcp.hub.enabled: true` 即必须鉴权——`hub.auth` 缺段 /
+   `tokens` 缺省 / 为空 / 全部无有效值 → **文件级错误拒绝启动**（不提供 `auth.enabled` 开关，
+   聚合面没有"裸奔"形态；报错文案指名缺失项，与 `--config-file` 致命语义同层）。
 6. token 条目：`token` 单字段（v5，可为 `${VAR}` 引用或明文兜底——明文装载 WARN，文件 600 要求），
    缺失/解析后为空 → 条目跳过 + WARN；
    `label` 缺省取序号；`servers` 引用不存在或未被 hub 纳入的 id → 该引用忽略 + WARN。
@@ -223,7 +232,7 @@ mcp:
      （`"Bearer ${T}"` → 解析为 `"Bearer <env 值>"`）；不匹配该形态的 `${...}` 与 `$$` 均按字面处理
      （`$$` 折叠为单个 `$`，作为兜底逃生口）；
    - **解析时机**：装载时一次性解析（对齐 clap `DUCT_USER/DUCT_PASSWD` 的启动即读语义），运行期不做
-     惰性解析、改 env 必须重启（吊销/轮换语义与 P1 静态模型一致，见 §5.8.3）；
+     惰性解析、改 env 必须重启（吊销/轮换语义与静态 token 模型一致，见 §5.8.3）；
    - **fail-safe（宁缺勿半）**：token 引用的变量缺失 → 该条目跳过 + WARN（全跳光触发规则 5 致命）；
      credentials 引用的变量缺失 → **该 server 整个凭证条目失效** → 该 server 自动摘出聚合
      + WARN（绝不带着 `Bearer ` 空密钥去握后端——半截凭证比缺席更危险；摘出后 `/mcp/{id}` 转发不受影响）；
@@ -245,8 +254,8 @@ GET  /mcphub        → 一期 405（无 server→client 主动流；§2.2）
   `segments.len() >= 2 && segments[1] == "mcphub"` → `mcp_hub::serve_conn_from_prelude(hub, prelude, stream)`
   （复用 `bridge.rs` 公共桥）。判定粒度与 mcp 臂一致（query 后缀行为同款）。**六分支 → 七分支**，
   AGENTS.md/README 契约同步更新（T8）。
-- **鉴权门（v3，先于一切 handler）**：`hub.auth.enabled` 时，**所有** `/mcphub*` 请求（含 `initialize`，
-  防匿名会话枚举）过 Bearer token 校验（§5.8.1）；失败 → 401 + `WWW-Authenticate: Bearer error="invalid_token"`，
+- **鉴权门（v3，v6 强制化；先于一切 handler）**：**所有** `/mcphub*` 请求（含 `initialize`，
+  防匿名会话枚举）过 Bearer token 校验（§5.8.1；hub 启用即必然启用，无未鉴权形态）；失败 → 401 + `WWW-Authenticate: Bearer error="invalid_token"`，
   同样成对落轨迹（`request/end{rejected}`，只记 label/不记值）。
 - **为什么 `/mcphub`（评审决策 Q2）**：与 `/mcp/*` 路由表完全隔离——
   ① `mcp::router` 与 `mcp.rs` 零改动（v1 需在 mcp router 内赌 matchit static>param 优先级、注册 `/mcp/hub` 静态路由）；
@@ -373,20 +382,20 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
 
 - **载体**：`Authorization: Bearer <token>`（标准形态；Claude/Cursor 等 remote MCP client 均支持自定义
   headers；将来若接 spec 的 OAuth 2.1 资源服务器链路，Bearer 形态天然兼容）。
-- **token 签发两段式**：
-  - **P1 静态 token 表（一期实现，已满足"hub 签发唯一鉴权 token"）**：管理员以 `openssl rand -hex 32`
-    生成、以 `${DUCT_HUB_TK_xxx}` 引用形式写入 `mcp.hub.auth.tokens`（v5：与后端凭证同一 env 读取
-    语法），随配置分发给客户端——"签发"发生在部署面。
-    "唯一"表达为长度 1 的列表；多 token 供**按客户端最小权限**（scope）与**定点吊销**（删条目重启）。
-  - **P2 动态签发端点（任务位 T14，一期不做）**：`POST /mcphub/token` 以 bootstrap 凭据换取
-    HMAC 自签限时 token（`{sub, scope, exp}`，验证免存储、无状态），补齐吊销时效与过期语义。
+- **token 签发（v6 决策 Q12：静态 token 表，单形态）**：管理员以 `openssl rand -hex 32`
+  生成、以 `${DUCT_HUB_TK_xxx}` 引用形式写入 `mcp.hub.auth.tokens`（v5：与后端凭证同一 env 读取
+  语法），随配置分发给客户端——"签发"发生在部署面。
+  "唯一"表达为长度 1 的列表；多 token 供**按客户端最小权限**（scope）与**定点吊销**（删条目重启）。
+  动态签发端点（v3 设想 `POST /mcphub/token` HMAC 限时 token）**取消**（Q12）：吊销时效诉求以
+  "删条目 + 重启"满足；若未来出现分钟级吊销/过期需求，另立评审（编号 T14 作废不复用）。
 - **校验**：hub router 最外层（axum middleware/统一入口函数），先于 initialize（防匿名会话枚举）；
   从 Bearer 提取后与有效 token 表做**恒定时间比较**（自实现 ct-compare 小函数，不引新依赖）；
   无 `Authorization` 头/格式错/不命中 → **401** + `WWW-Authenticate: Bearer error="invalid_token"`，
   成对落轨迹后短路（不进会话表、不建任何后端连接）。
-- **fail-closed 自检**：`enabled: true` 但 token 表为空/全无效 → **装载致命**（§5.1 规则 5）。
-- **缺段 = 不鉴权**：auth 段缺省或 `enabled: false` 时 hub 与 A/aiproxy 同语义（内网信任边界），
-  文档强推 hub 场景显式开启（§6 风险 #12）。
+- **启动强制（v6 决策 Q14）**：`mcp.hub.enabled: true` 即必须鉴权——token 表缺失/为空/全无效 →
+  **拒绝启动**（配置级致命，§5.1 规则 5）；**不存在"启用 hub 但不鉴权"的运行形态**，
+  `auth.enabled` 开关键废止。hub 的暴露面即执行面，fail-closed 是唯一姿态；
+  hub 整体不启用（`enabled: false` 或缺 `mcp.hub` 段）时 `/mcphub` 回 404 disabled（§5.2），与鉴权无关。
 - **审计**：命中的 token `label` 进 trace（`request/start.auth`）；**token 值本身永不落**轨迹/日志。
 
 #### 5.8.2 hub → 后端：配置凭证注入（v4：凭证专属 hub 命名空间）
@@ -422,8 +431,8 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
 - **内存态脱敏（v5 新增硬约束）**：解析完成后的 `HubConfig`（含 token 明文值与注入 header 值）**驻留内存
   但 `Debug`/序列化实现必须逐字段 `***`**（手工 impl，禁止 derive 裸 dump）——防止 `-v`、tracing、
   panic 路径把解引用后的密钥带进日志；单测断言 `format!("{:?}", hub_config)` 不含任何已解析值（K6）。
-- **吊销与轮换**：P1 = 删 token 条目/换 env 重启（重启即全量吊销，粗但可靠）；后端凭证轮换 = 换 env 重启。
-  P2 限时 token 补齐分钟级吊销（T14）。
+- **吊销与轮换（v6 定稿）**：唯一手段 = 删 token 条目/换 env 后重启（重启即全量吊销，粗但可靠）；
+  后端凭证轮换 = 换 env 重启。动态/限时 token 已被 Q12 排除，如未来出现分钟级吊销诉求另立评审。
 - **DoS/暴力**：一期鉴权失败只计数 + WARN 日志（trace `rejected`），**无限速**（轻量定位）；
   防爆破限速/backoff 列二期（T15）；叠加闸门仍是五道：`max_tools`/`name_max_len`/`max_sessions`/`backend_timeout`/`list_ttl`。
 - **会话 id 纪律不变**：hub 对外 sid 随机 uuid 不可猜；后端 sid 永不外泄、不进轨迹（沿用 A 判定）。
@@ -485,9 +494,9 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
 | 9 | `tools/list` 与 `tools/call` 竞态（快照过期、后端工具下线） | 路由按前缀现算不依赖快照；后端 -32602 原样回 | 已设计（§5.4 入站防御） |
 | 10 | 巨工具描述注入 hub 内存 | 快照上限 `max_tools`；单条目大小随 envelope 解析上限（`--max-body` 只罩请求，后端响应无界 → fan-out 聚合处加 per-backend 响应字节帽） | 二期加 `max_result_bytes`；一期至少 `backend_timeout` 兜时间 |
 | 11 | spec 再修订（2025-11+）影响会话/授权语义（如 OAuth resource server 条款） | 转发设计 Q6 未决项在 hub 上权重更高（要握手，不再是透传） | 立项 spike 先复核原文；协议层集中在 `backend.rs`/`mod.rs` 便于跟进 |
-| 12 | 聚合面安全暴露 | 一把钥匙 N 个可执行后端 | v3 主答案 = `hub.auth` 统一 token（部署文档强推开启）；叠加 per-server `hub:false` 显性摘除 + 内网边界（§5.8.1） |
-| 15 | 后端凭证集中保管（v3，P5 破例的固有风险） | hub 成为凭证单点蜜罐：一泄全泄 | env 引用首选/明文 600；trace/日志零落值；重启即吊销（P1）+ P2 限时 token；内网边界不变 |
-| 16 | P1 静态 token 无过期、可重放 | 网络窃听=长期凭证泄露 | duct 监听 HTTP——传输加密属部署面（反代 TLS/SSH 隧道，deploy.md 增补）；P2 限时 token（T14）补时效 |
+| 12 | 聚合面安全暴露 | 一把钥匙 N 个可执行后端 | **v6：鉴权强制（Q14，无 token 启动失败）**；叠加 per-server `hub:false` 显性摘除 + scope 最小权限 + 内网边界（§5.8.1） |
+| 15 | 后端凭证集中保管（v3，P5 破例的固有风险） | hub 成为凭证单点蜜罐：一泄全泄 | env 引用首选/明文 600；trace/日志零落值 + `Debug` 脱敏（K6）；重启即吊销（Q12 静态形态的内建兜底）；内网边界不变 |
+| 16 | 静态 token 无过期、可重放（v6：Q12 定静态） | 网络窃听=长期凭证泄露 | duct 监听 HTTP——传输加密属部署面（反代 TLS/SSH 隧道，deploy.md 增补）；scope 限制得手半径；确需限时凭证时另立评审（T14 已废） |
 | 17 | token 暴力猜测 | 32B 随机 token 熵足够；无限速仍留审计 | 失败计数 + WARN（trace `rejected`）；限速/backoff 列 T15；scope 限制得手半径 |
 | 13 | `/mcphub` 与正向代理流量撞名 | absolute-form（`GET http://host/mcphub`）不进 origin-form 分流，仍走正向代理 | 与 forwarding §7 #7 同构；dispatch 测试锁定（J7） |
 | 14 | per-server 开关配置漂移（转发要、聚合不要，反之亦然） | 开关只表达「是否进聚合面」，与转发存在性解耦（§5.1 规则 2）；启动日志/`/mcp` 用法列表标出纳入集 | 可观测性兜底（T8 文档写明） |
@@ -519,15 +528,16 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
   **全文扫描不出现**、`sse:false` 验证（仿 A 的 I8）。
 
 鉴权（v3 新增 K 组）：
-- K1 auth 开启：无头/错 token → 401 + `WWW-Authenticate`，**零后端触达**（mock 断言连接数为 0）、
-  轨迹成对 `rejected`；对 token → 全链路通；auth 缺省 → 匿名直通（默认语义回归）；
+- K1 鉴权（v6 强制化）：无头/错 token → 401 + `WWW-Authenticate`，**零后端触达**（mock 断言连接数为 0）、
+  轨迹成对 `rejected`；对 token → 全链路通；**不存在匿名直通路径**（auth 缺段启动即败，见 K4）；
 - K2 scope：token-A 仅 `[github]` → list 只见 github 工具；直呼 `fs__x` → 与不存在工具**同文**的 -32602
   （错误消息不区分断言）；label 进 trace、token 值全文扫描不出现；
 - K3 凭证置换（hub 面）：后端 mock 断言收到的 `authorization` == `hub.credentials` 配置值；客户端自带
   `authorization` 被剥离；自定义凭证头（x-corp-token）同断言；`credentials` 未列出的 server 匿名可达。
   **A 面对照断言**：同 server 经 `/mcp/{id}/*` 转发时客户端 `authorization` **原样透传**、无注入
   （"透明转发不碰鉴权头"的两侧回归锁——v4 契约测试）；
-- K4 装载自检（v5 语义）：`auth.enabled` + 空 token 表 → 致命；`credentials.<id>` 引用未知/未纳入 id → 忽略 + WARN；
+- K4 装载自检（v6 语义）：**hub 启用 + `hub.auth` 缺段/空 tokens/全无效 → 拒绝启动**（fail-closed，Q14）；
+  `credentials.<id>` 引用未知/未纳入 id → 忽略 + WARN；
   **token 的 `${VAR}` 未设** → 该条目跳过 + WARN（全跳光 → 致命）；
   **credentials 的 `${VAR}` 未设** → 该 server 摘出聚合 + WARN（不匿名硬握、不半截注入）；
 - K6 内存态脱敏（v5）：装载含 env 解析的 `HubConfig` 后，`format!("{:?}", cfg)` 与其 tracing/Display
@@ -553,7 +563,7 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
 | T9 | clippy + fmt 门禁 | CI |
 
 （二期任务位：T10 GET fan-in 通知流 + listChanged；T11 resources/prompts 聚合；T12 反向请求中继 id 翻译；
-T13 后端响应字节帽/可逆短名；**T14 动态签发端点 `POST /mcphub/token`（HMAC 限时 token，§5.8.1 P2）**；
+T13 后端响应字节帽/可逆短名；~~T14 动态签发端点~~ **作废（Q12 定为静态 token）**；
 **T15 鉴权失败限速/backoff（§5.8.3）**；设计增量届时补 §9。）
 
 规模预估：一期 ≈ 1700–2400 行实现 + ≈ 1200–1600 行测试（帧扫描器/会话表/envelope 三块是主体；
@@ -567,7 +577,7 @@ v3 鉴权层 ≈ +150–250 行——Bearer 提取/恒定时间比较/scope 装�
 |---|---|---|
 | Q1 | 形态：duct 内建（A）vs sidecar（B）vs 开源（C） | ✅ **评审已定：内建**——`mcp_hub/` 模块，opt-in `mcp.hub.enabled` 默认关；「懂协议」爆炸半径关进门控模块内 |
 | Q2 | 端点路径 | ✅ **评审已定：顶层固定 `/mcphub`**——与 `/mcp/*` 转发彻底隔离；分流六→七分支；`path` 不可配、"hub 保留 id" 规则删除 |
-| Q3 | 命名方案 | 恒前缀 `{server}__{tool}` + `_meta.hub` 附原值；sep 固定 `__`。v2 精化：id 含 `__` 时**自动摘出聚合 + WARN**（不再整条跳过，转发保留）——待复核 |
+| Q3 | 命名方案 | ✅ **v6 评审已定**：恒前缀 `{server}__{tool}` + `_meta.hub` 附 `{server, original}`；sep 固定 `__`；id 含 `__` 者自动摘出聚合 + WARN（转发保留，§5.1 规则 3）。不做"无冲突原名直通"变体（可预测性优先） |
 | Q4 | 会话模型 | M1 每客户端一套后端会话——v3 修正论据：凭证已入配置，M1 不再以"P5 瞬时性"为前提，理由收敛为**会话语义隔离**；M2 池化技术上解锁、语义风险仍在，维持不做——待复核 |
 | Q5 | 一期反向请求处置 | 帧扫描器吞帧 + trace/WARN 的「断流降级」；若嫌粗，一期 tools/call 仅接 JSON 响应、SSE 响应整包按 A 透传（放弃 progress 识别）——**推荐前者**，待复核 |
 | Q6 | capabilities 对外声明 | v1 `{tools:{listChanged:false}}`；resources/prompts/补全类一律不声明（诚实暴露）——待复核 |
@@ -576,6 +586,6 @@ v3 鉴权层 ≈ +150–250 行——Bearer 提取/恒定时间比较/scope 装�
 | Q9 | 聚合纳入粒度 | ✅ **评审已定：`mcp.servers.<id>.hub: bool`，默认启用**；`false` 仅摘出聚合面、透明转发保留（v1 `hub.servers` 白名单作废） |
 | Q10 | 凭证集中保管破例（v3） | ✅ **需求已定**：后端鉴权统一配置在 hub（v4：**专属命名空间 `mcp.hub.credentials`**，`servers` 段无鉴权字段），A 路径零接触 + 零感知（不碰鉴权头：不注不剥，客户端头照旧透传）；治理四件套见 §2.3/§5.8.3，AGENTS.md #1 修订登记进 T8 |
 | Q11 | 客户端凭证形态（v3） | ✅ **需求已定**：hub 签发唯一 token 替代原 mcp server 鉴权头；实现取 `Authorization: Bearer`（§5.8.1）；客户端凭证**不向后端透传**（剥离+置换，§5.8.2） |
-| Q12 | token 签发机制 | 建议：**P1 静态 token 表**（env 注入、label 审计、per-token scope、fail-closed）即满足需求；P2 `POST /mcphub/token` HMAC 限时 token 列 T14——待复核 |
+| Q12 | token 签发机制 | ✅ **v6 评审已定：静态 token 表**（env 注入、label 审计、per-token scope）；动态签发端点取消（T14 作废），吊销 = 删条目重启；限时凭证需求出现时另立评审 |
 | Q13 | 凭证配置形状 | ✅ **v4 定命名空间 / v5 定引用形态**：`mcp.hub.credentials.<id>.headers.{名: 值}`，值支持 `${VAR}` 值级 env 插值（出入站统一语法，装载时一次解析，缺失 fail-safe 摘除；`*_env` 整块键废止）——`/mcp/*` 转发配置面不存在鉴权概念 |
-| Q14 | 鉴权默认姿态 | 建议：`hub.auth` 缺段 = 不鉴权（duct opt-in 传统）；但 README/deploy **强推 hub 场景开启**（聚合面即执行面）——待复核 |
+| Q14 | 鉴权默认姿态 | ✅ **v6 评审已定：强制鉴权**——hub 启用即必须有效 token，否则**拒绝启动**（fail-closed 唯一形态，`auth.enabled` 键废止）；"启用 hub 但不鉴权"不存在（§5.1 规则 5 / §5.8.1） |

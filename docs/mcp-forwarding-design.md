@@ -393,7 +393,7 @@ Socket 级集成（`tests/mcp.rs` + dispatch 平移）：
 | Q2 stdio | 不内建子进程托管；README/deploy 给出 supergateway 组合姿势 | ✅ **按推荐执行** |
 | Q3 聚合 | 确认不做单端点工具聚合（§2.4） | ✅ 按推荐执行，转发本身不做（已单独立项并评审定稿：内建形态、端点 `/mcphub`、per-server `hub` 开关默认启用 → `docs/mcp-hub-design.md` v2） |
 | Q4 origin_policy 默认值 | `keep`（透传，与 aiproxy 无侵入哲学一致）；`strip`/`upstream` 按需显式配置 | ✅ 按推荐执行 |
-| Q5 配置形态 | 取 `mcp.servers.<id>.{url, origin_policy}` 嵌套段（`transport` 键二期随 B 启用） | ✅ **已确认**（v3 微调：本期两键） |
+| Q5 配置形态 | 取 `mcp.servers.<id>.{url, origin_policy}` 嵌套段（`transport` 键二期随 B 启用） | 🔄 **被 hub v7 指令超越**：mcp server 清单的事实源迁移至标准 `mcp.json`（`mcpServers`，含 headers/扩展键），`mcp.servers` yaml 段废止 → `docs/mcp-hub-design.md` §5.1 + 任务 TM；转发行为语义不变 |
 | Q6 规范复核 | MCP 是否有 2025-06-18 之后的新修订影响 §2.3 结论（如 `Mcp-Param-*` 头、轮询长轮询语义） | ⏳ 联网通道恢复后复核一次（预计不改 A 方案结论，仅可能增补透传头清单） |
 
 ---

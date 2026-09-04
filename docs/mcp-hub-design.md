@@ -1,6 +1,6 @@
 # duct MCP 聚合网关（mcp hub）调研与设计方案
 
-> 状态: **设计 v3（未实现）**。范围建议：**一期只做 tools 聚合（list + call）+ hub 鉴权**，resources/prompts/通知流/反向请求中继进二期。
+> 状态: **设计 v4（未实现）**。范围建议：**一期只做 tools 聚合（list + call）+ hub 鉴权**，resources/prompts/通知流/反向请求中继进二期。
 > **修订记录**:
 > - v1: 初版设计稿（端点 `/mcp/hub` + 子集白名单形态）。
 > - v2: **评审落地三项决策**——① 形态定为 **duct 内建**（§4 方案 A）；② 端点定为**顶层固定路径 `/mcphub`**
@@ -13,6 +13,11 @@
 >   ③ 由此对不变量 #1（凭证零接触）产生 hub 限定的**受控破例**（§2.3/§5.8 治理登记）；
 >   ④ 连带重写：会话模型论据（§5.3，凭证不再依赖客户端 in-flight → 可预热/后台重建）、
 >   scope 授权（§5.4，token 级工具面裁剪）、注入/剥离链（§5.6）、启动自检 fail-closed（§5.1 规则 5）。
+> - v4: **A 路径鉴权非介入原则成文化 + 配置面彻底分离（评审指令："/mcp/\* 透明转发不需要碰鉴权头"）**——
+>   后端凭证从 `mcp.servers.<id>.auth` **迁入 `mcp.hub.credentials.<id>`**：`servers` 段回到
+>   v2 的三键形态（url/origin_policy/hub），鉴权在 **A 的配置模型、代码路径、行为语义三个层面都不存在**；
+>   同时精确化 A 的契约表述：**不碰 ≠ 剥离**——客户端自带鉴权头在 A 路径仍作为普通头**原样透传**
+>   （A 的既有用法就是客户端自带凭证），hub 的剥离链只存在于 hub 自己的请求组装里。
 > 定位变化: 这是 duct **第一个需要「理解 MCP 协议 envelope」的组件**——正是 `mcp-forwarding-design.md` §2.4
 > 判过「与轻量中转定位冲突、列入非目标、如未来需要单独立项」的 **D 方案（聚合网关）**。本文即该立项的设计稿。
 > 关联: `docs/mcp-forwarding-design.md`（A 方案已落地 `feat/mcp-forwarding`，本方案复用其传输底座与配置体系）、
@@ -34,8 +39,11 @@
 
 **已定需求决策（v2/v3 评审输入）**：① 形态为 **duct 内建**（非 sidecar、非开源引入）；
 ② 端点使用 **`/mcphub`**，与 `/mcp/*` 转发路径避免冲突；③ 配置支持**对指定 mcp server 启用/禁用聚合，默认启用**；
-④ **（v3）鉴权分层**：后端 MCP server 的鉴权凭证统一配置在 hub；客户端只持有 **hub 签发的唯一鉴权 token**
-（替代原 mcp server 的鉴权头——透明透传模型在聚合面不适用）。
+④ **（v3）鉴权分层**：后端 MCP server 的鉴权凭证统一配置在 hub（**v4：收敛于 `mcp.hub.credentials`，
+`mcp.servers` 段无鉴权字段**）；客户端只持有 **hub 签发的唯一鉴权 token**
+（替代原 mcp server 的鉴权头——透明透传模型在聚合面不适用）；
+⑤ **（v4）边界裁决**：`/mcp/*` 透明转发**不需要也不允许碰鉴权头**——不注入、不剥离、不改写，
+客户端凭证头照旧原样透传（A 语义零变化）。
 对应设计落点：§4-Q1 / §5.1-Q9 / §5.2-Q2 / §5.8-Q10~Q14。
 
 ### 1.2 目标形态
@@ -50,7 +58,7 @@
 │ tools/list ：扇出 N 后端 → 改名合并（github__create_issue …）→ 分页 │
 │ tools/call ：按前缀反查路由 → 原样调用后端 → 响应/进度流透传        │
 │ 会话表     ：hub session → {server → backend session}（懒建、TTL）  │
-│ 凭证置换   ：剥离客户端鉴权头 + 注入 per-server 配置凭证（§5.8）    │
+│ 凭证置换   ：剥离客户端鉴权头 + 注入 hub.credentials 配置凭证（§5.8）│
 └──────────┬───────────────┬───────────────┬─────────────────────────┘
            ▼               ▼               ▼
    github (Bearer ghp_…)  fs (x-api-key…)  internal (custom header…)
@@ -81,8 +89,8 @@ result.tools 条目名），其余字节（arguments、content 数组、错误�
 | F2 | 会话双层管理 | hub session ↔ 每后端一个懒建 backend session；backend session 失效（404）透明重建一次；客户端 DELETE/空闲 TTL 收尾 |
 | F3 | tools/list 聚合 | 并发扇出全部**纳入**的 server（per-server `hub` 开关，默认启用）→ 合并工具表（改名 §5.4）→ 统一游标分页 → 单后端失败**降级**不阻塞整体 → 快照 + TTL 缓存 |
 | F4 | tools/call 路由 | 反解工具名前缀 → 定位后端与原名 → 透传 arguments/_meta → 原样中继 result（含 JSON 与 SSE 两形态、progress 通知、isError） |
-| F5 | 鉴权与凭证分层（v3） | 客户端→hub：hub 签发的统一 Bearer token（token 表 + scope）；hub→后端：per-server 配置凭证注入；客户端原始后端凭证被**剥离不下传**。详见 §5.8 |
-| F6 | 与 A 并存零回归 | `/mcp/{server}/*` 透明转发行为不变（含 P5 零接触语义不变：不读不注不剥客户端头）；hub 挂**独立顶层路径 `/mcphub`**（§5.2），与 mcp 路由表零交集 |
+| F5 | 鉴权与凭证分层（v3） | **仅 hub 面**：客户端→hub 用 hub 签发的统一 Bearer token（token 表 + scope）；hub→后端用 `hub.credentials` 配置凭证注入，并剥离客户端自带的鉴权头（不后传）。详见 §5.8 |
+| F6 | 与 A 并存零回归（v4 成文化） | `/mcp/{server}/*` 透明转发**不碰鉴权**：`mcp.servers` 无鉴权字段、A 代码零引用凭证配置、客户端鉴权头仍作普通头**原样透传**（不碰 = 不介入，非剥离）。hub 挂**独立顶层路径 `/mcphub`**（§5.2），与 mcp 路由表零交集 |
 | F7 | 轨迹可观测 | 每个 hub 请求一条 trace：握手、鉴权 label（不记 token 值）、扇出各后端耗时/工具数、路由到的 server、流收尾——复用 trace.jsonl（§5.10） |
 | F8 | 部署假设显性化 | 会话表在进程内存 → 单实例假设，README/deploy 标注（§6 风险 #4） |
 
@@ -105,7 +113,8 @@ result.tools 条目名），其余字节（arguments、content 数组、错误�
   （行状态机，逐帧产出，不整包缓冲——即 `ToolNameRewriter` 既有形态）。其余路径不破例。
 - **#1 凭证零接触（v3 新增破例，hub 限定）**：hub 将**长期保管**后端 MCP server 的鉴权凭证（配置注入）
   并对客户端**签发/校验**自己的 token——这是 duct 第一次存凭证、第一次注入凭证。治理四件套（§5.8）：
-  ① 作用域锁死在 hub（`mcp.servers.<id>.auth` 仅 hub 消费；**A 透明转发路径语义不变**，不读不注不剥）；
+  ① 作用域锁死在 hub（v4 强化：凭证配置在 `mcp.hub.credentials` **专属命名空间**，`mcp.servers` 条目
+  无鉴权字段；A 透明转发在配置模型与代码路径两层都不接触鉴权，**A 语义零变化**）；
   ② 首选 env 引用注入（`headers_env`/`token_env`），配置明文要求文件 600 + 装载 WARN；
   ③ 后端凭证值与 hub token 值**永不进轨迹/日志**（沿用 SENSITIVE_HEADERS 脱敏 + token 只记 `label`）；
   ④ AGENTS.md 不变量 #1 修订登记（T8 文档任务）："零接触"约束精确到转发路径，hub 凭证枢纽形态单列治理条款。
@@ -151,18 +160,11 @@ result.tools 条目名），其余字节（arguments、content 数组、错误�
 
 ```yaml
 mcp:
-  servers:                       # 现有段；v2 加 hub 开关；v3 加 auth 凭证（仅 hub 消费）
-    github:
-      url: https://api.githubcopilot.com/mcp
-      auth:
-        headers_env: DUCT_CRED_GITHUB   # JSON 环境变量 {"authorization":"Bearer ghp_xxx"}（首选，密钥不落盘）
-    fs:       { url: http://127.0.0.1:9100/mcp }   # 无 auth = 该后端匿名
+  servers:                       # v4 形态：三键 url / origin_policy / hub —— 无任何鉴权字段
+    github:   { url: https://api.githubcopilot.com/mcp }
+    fs:       { url: http://127.0.0.1:9100/mcp }
     debug:    { url: http://127.0.0.1:9200/mcp, hub: false }       # 显式禁用聚合：仅 /mcp/debug 转发
-    internal:
-      url: http://mcp.corp:9000/mcp
-      origin_policy: upstream
-      auth:
-        headers: { x-corp-token: "…" }  # 内联明文：要求 config 文件 600，装载 WARN 引导用 env
+    internal: { url: http://mcp.corp:9000/mcp, origin_policy: upstream }
   hub:                           # 新增可选段；缺省 = hub 不启用
     enabled: true
     auth:                        # v3：客户端侧统一鉴权（缺段 = 不鉴权，与 duct 无鉴权传统一致）
@@ -173,6 +175,9 @@ mcp:
           servers: [github, fs]         # 可选 scope；缺省 = 全部 hub 纳入 server
         - label: ci
           token_env: DUCT_HUB_TK_CI     # "唯一 token" = 长度 1 的列表；多 token 供最小权限
+    credentials:                 # v4：hub→后端凭证（hub 专属命名空间；未列出的 server 匿名）
+      github:   { headers_env: DUCT_CRED_GITHUB }   # JSON env {"authorization":"Bearer ghp_xxx"}（首选）
+      internal: { headers: { x-corp-token: "…" } }  # 内联明文：要求文件 600，装载 WARN 引导用 env
     separator: "__"              # 工具改名分隔符；本期仅支持 "__"
     list_ttl: 300                # 秒；合并快照缓存期（客户端请求触发重取）
     backend_timeout: 15          # 秒；扇出/单后端调用无响应超时（区别于 connect 超时）
@@ -183,7 +188,7 @@ mcp:
 ```
 
 装载规则在 A 的三层语义上追加（仍是条目级容错）：
-1. `mcp.hub` / `mcp.hub.auth` 未知键静默忽略（与 `transport` 预留惯例一致）；`enabled` 缺省 false（缺段 = 不启用）。
+1. `mcp.hub` / `mcp.hub.auth` / `mcp.hub.credentials` 未知键静默忽略（与 `transport` 预留惯例一致）；`enabled` 缺省 false（缺段 = 不启用）。
 2. **per-server 开关（v2 决策 Q9）**：`mcp.servers.<id>` 第三键 `hub: bool`，**默认 true**。
    `hub: false` 只把该 server 摘出聚合面——它的 `/mcp/{id}/*` 透明转发端点**完整保留**。
    这替代了 v1 的 `hub.servers` 子集白名单（默认启用 + 显式禁用，与 `normalize_sse` 的 per-provider 布尔先例同构）。
@@ -194,8 +199,13 @@ mcp:
    **文件级错误拒绝启动**（"开了鉴权却无可用凭证"比无鉴权更危险，不静默放行也不静默锁死）。
 6. token 条目：`token_env`（首选，环境变量单值）与 `token`（明文兜底，文件 600 WARN）二取一，缺失 → 条目跳过 + WARN；
    `label` 缺省取序号；`servers` 引用不存在或未被 hub 纳入的 id → 该引用忽略 + WARN。
-7. `servers.<id>.auth`：`headers_env`（JSON 映射，首选）与 `headers`（内联 map 兜底）二取一；
-   二者皆缺 = 该后端匿名请求（无鉴权 server 场景）。**该键仅 hub 消费，A 透明转发不读、不注、不剥。**
+7. **凭证命名空间（v4）**：`hub.credentials.<id>` 的键必须是 `mcp.servers` 中存在且 `hub: true` 的 id，
+   否则该条忽略 + WARN（凭证不会静默配到转发面/不存在的 server 上）；条目内 `headers_env`
+   （JSON 环境变量，首选）与 `headers`（内联 map 兜底，文件 600 + WARN）二取一；
+   未出现在 `credentials` 中的 server = hub 对其匿名请求（fs/supergateway 场景）。
+8. **A 零鉴权契约（v4，硬约束）**：`mcp.servers` 段的解析模型（`McpServerConfig`）**没有鉴权字段**；
+   凭证只活在 `HubConfig` 里，`mcp.rs` 转发路径对 `hub` 段零读取——分离发生在类型层，
+   无需靠"约定不读"维持；A 既有的 I 组测试（凭证透传断言）保持零修改即为本契约的回归锁。
 
 ### 5.2 端点与分流（六分支 → 七分支）
 
@@ -272,7 +282,7 @@ POST tools/list (hub session)
  ├─ 快照有效（list_ttl 内，含未翻完页）→ 直接对快照出页
  └─ 否则扇出：
      for each 纳入 server（配置序，hub:true；scope 外直接跳过不扇出 §5.4）:
-        ensure BackendSession（懒 initialize；凭证取 per-server 配置注入 §5.8.2，应用 origin_policy）
+        ensure BackendSession（懒 initialize；凭证取 hub.credentials 配置注入 §5.8.2，应用 origin_policy）
         → tools/list 循环翻页拉平（backend_timeout 约束）
      merge（改名/附 _meta/max_tools/name_max_len 过滤）→ 新快照 {rev, tools[], degraded[]}
      失败后端 → 记 degraded，列表照常返回；全失败 → JSON-RPC internal error + trace
@@ -284,7 +294,7 @@ POST tools/list (hub session)
 ```
 POST tools/call → scope 校验（§5.4）→ 前缀反解 → (server, originalName)
  ├─ ensure BackendSession → 改写 name 后原样重发（客户端 jsonrpc id 不变 → 单后端无需 id 翻译）
- │    转发头组装：客户端头 − 剥离集(SENSITIVE_HEADERS 名单 ∪ 该 server auth 头名) + 配置凭证注入（§5.8.2）
+ │    转发头组装：客户端头 − 剥离集(SENSITIVE_HEADERS 名单 ∪ 该 server hub.credentials 头名) + 配置凭证注入（§5.8.2）
  │    ※ 客户端自带的鉴权类头**永不到达后端**——凭证置换是本模型的核心语义
  ├─ 响应 application/json → 原样回给客户端（含 isError/error）
  └─ 响应 text/event-stream → **帧扫描器**（ingest/finish 行状态机，复用 sse_normalize.rs 既有形态）：
@@ -311,7 +321,7 @@ src/
 │   ├── session.rs         # HubSession 表 + BackendSession 状态机 + GC
 │   ├── backend.rs         # MCP 客户端：initialize / tools/list 翻页 / tools/call / DELETE
 │   │                      #   （reqwest + mcp.rs 同款头黑名单/origin_policy；
-│   │                      #    v3：凭证注入/剥离链在此收口，取 per-server 配置 §5.8.2）
+│   │                      #    v3：凭证剥离/注入链在此收口，取 hub.credentials §5.8.2——A 路径无此环节）
 │   ├── merge.rs           # 快照、改名/反解、cursor、max_tools/name_max_len、scope 出页过滤
 │   ├── auth.rs            # v3：Bearer 提取 + 恒定时间校验 + token 表(scope) + 401 应答
 │   └── frames.rs          # envelope 解析（jsonrpc method/id/name）+ SSE 帧扫描器
@@ -355,24 +365,30 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
   文档强推 hub 场景显式开启（§6 风险 #12）。
 - **审计**：命中的 token `label` 进 trace（`request/start.auth`）；**token 值本身永不落**轨迹/日志。
 
-#### 5.8.2 hub → 后端：配置凭证注入
+#### 5.8.2 hub → 后端：配置凭证注入（v4：凭证专属 hub 命名空间）
 
-- **配置形态**：`mcp.servers.<id>.auth.headers_env`（JSON 环境变量，首选，密钥不落盘——对齐
-  `DUCT_USER/DUCT_PASSWD` env 先例与 deploy.md env-file 实践）或 `auth.headers`（内联 map 兜底，
+- **配置形态**：`mcp.hub.credentials.<id>.headers_env`（JSON 环境变量，首选，密钥不落盘——对齐
+  `DUCT_USER/DUCT_PASSWD` env 先例与 deploy.md env-file 实践）或 `.headers`（内联 map 兜底，
   要求文件 600 + 装载 WARN）。多 header 注入天然支持（`authorization` + 自定义 key 并存）。
-- **注入与剥离（核心语义）**：组装转发/后端会话请求时——
-  ① 从客户端头集合中**剥离**：该 server `auth` 配置出现的头名 ∪ SENSITIVE_HEADERS 名单
+  **v4 裁决（评审指令）**：凭证不放 `mcp.servers.<id>`——`servers` 段保持三键纯形态，
+  鉴权整体收进 hub 段（`auth` 管进门、`credentials` 管出门），A 的配置模型里根本没有这个概念。
+- **注入与剥离（核心语义，只发生在 hub 的请求组装里）**：
+  ① 从客户端头集合中**剥离**：该 server `credentials` 出现的头名 ∪ SENSITIVE_HEADERS 名单
   （`authorization`/`x-api-key`/`api-key`/…）——客户端即便误带后端凭证也不会下传；
   ② 注入配置凭证；③ 其余头仍走黑名单制透传（不变量 #2 在"非凭证段"上继续成立）。
-  无 `auth` 配置的 server = 匿名请求（fs/supergateway 场景零改动）。
-- **消费边界**：`auth` 键**仅 hub 消费**；`/mcp/{id}/*` 透明转发不读不注不剥（A 路径的 P5 语义原样）。
-  配置写了两处、行为只有一处——README 需把这条不对称写明白（T8），避免运维误以为转发也会注入。
+  未列入 `credentials` 的 server = 匿名请求（fs/supergateway 场景零配置）。
+- **A 路径零鉴权（契约，v4 成文化）**：`/mcp/{id}/*` 透明转发**不碰鉴权头**——不注入、不剥离、不改写，
+  客户端的 `Authorization` 等凭证头仍按黑名单制**原样透传**（A 的既有用法就是客户端自带凭证直连后端，
+  "不碰" = 不介入，**不是**代客户端剥离）。实现保障：凭证只存在于 `HubConfig` 类型内，
+  `McpServerConfig` 无鉴权字段、`mcp.rs` 对 `hub` 段零读取——类型层面即无耦合通道；
+  A 的既有 I 组测试（凭证字节透传断言，tests/mcp.rs）零修改通过即回归锁（J7）。
 - **凭证获取时机解锁**：后端 initialize/重建不再要求客户端 in-flight（凭证来自配置）→
   预建/keep-warm/后台 list 刷新成为可选增强（一期仍懒建，代码结构不为凭证模型让路）。
 
 #### 5.8.3 治理与安全（P5 破例的四件套）
 
-- **作用域**：保管/注入凭证只存在于 hub 特性内（`mcp.hub.enabled` 且条目配了 `auth`）；A 与 aiproxy 不受波及。
+- **作用域**：保管/注入凭证只存在于 hub 段（`hub.credentials`）与 hub 开关（`mcp.hub.enabled`）内；
+  A 的 `McpServerConfig` 类型无鉴权字段，aiproxy 不受波及（v4 类型层锁死）。
 - **落盘面**：env 引用首选；内联明文 → 装载 WARN + deploy.md「600 权限 + env-file」指引；
   token 与凭证值**一律不进轨迹**（Authorization 类已被 SENSITIVE_HEADERS 覆盖；若未来启用自定义
   token 头名，须同步加入该名单——写进实现验收）。
@@ -477,9 +493,12 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
   轨迹成对 `rejected`；对 token → 全链路通；auth 缺省 → 匿名直通（默认语义回归）；
 - K2 scope：token-A 仅 `[github]` → list 只见 github 工具；直呼 `fs__x` → 与不存在工具**同文**的 -32602
   （错误消息不区分断言）；label 进 trace、token 值全文扫描不出现；
-- K3 凭证置换：后端 mock 断言收到的 `authorization` == 配置凭证；客户端自带 `authorization` 被剥离；
-  自定义凭证头（x-corp-token）同断言；未配 auth 的 server 匿名可达；
-- K4 装载自检：`auth.enabled` + 空 token 表 → 致命；`headers_env` 指向缺失变量 → 该 server 聚合降级 + WARN；
+- K3 凭证置换（hub 面）：后端 mock 断言收到的 `authorization` == `hub.credentials` 配置值；客户端自带
+  `authorization` 被剥离；自定义凭证头（x-corp-token）同断言；`credentials` 未列出的 server 匿名可达。
+  **A 面对照断言**：同 server 经 `/mcp/{id}/*` 转发时客户端 `authorization` **原样透传**、无注入
+  （"透明转发不碰鉴权头"的两侧回归锁——v4 契约测试）；
+- K4 装载自检：`auth.enabled` + 空 token 表 → 致命；`credentials.<id>` 引用未知/未纳入 id → 忽略 + WARN；
+  `headers_env` 指向缺失变量 → 该 server 聚合降级 + WARN；
 - K5 剥离集：客户端带任意 SENSITIVE_HEADERS 名单头 → 后端均不见。
 
 ---
@@ -489,7 +508,7 @@ JSON-RPC 对外错误一律用**协议形态**（`-32601/-32602/-32000` + messag
 | 任务 | 内容 | 验收 |
 |---|---|---|
 | T0 | spike：mock Streamable-HTTP 后端上跑通 hub 侧完整 initialize 握手 + list/call 骨架（验证 §3 假设、定帧扫描器形态） | 原型可演示 |
-| T1 | config.rs：`mcp.hub` 段（含 **v3 `auth` 子段 + `servers.<id>.auth`**）+ HubConfig；per-server `hub: bool`（默认 true）+ 单射性降级 + **fail-closed 自检（规则 5）** | H1-装载项、K4 |
+| T1 | config.rs：`mcp.hub` 段（含 **v3 `auth` 子段 + v4 `credentials` 命名空间**）+ HubConfig；`McpServerConfig` 保持三键（零鉴权字段，v4 契约）；per-server `hub: bool`（默认 true）+ 单射性降级 + **fail-closed 自检（规则 5）** | H1-装载项、K4 |
 | T2 | `mcp_hub/frames.rs` + `backend.rs`：envelope/SSE 帧扫描器 + MCP 后端 client（复用 §5.11 底座抽取；**凭证注入/剥离链 §5.8.2 在 client 侧收口**） | H4、K3、T0 语义回归为测试 |
 | T3 | `mcp_hub/session.rs`：双层会话表 + 懒建 + 重建 + GC + 上限（会话挂 scope） | H3 |
 | T4 | `mcp_hub/merge.rs`：快照/改名/反解/**scope 出页过滤**/分页/degraded（含 per-server 开关过滤） | H1 H2 |
@@ -522,8 +541,8 @@ v3 鉴权层 ≈ +150–250 行——Bearer 提取/恒定时间比较/scope 装�
 | Q7 | 单实例假设 | 接受，文档显性声明（duct 定位即单二进制）——待复核 |
 | Q8 | 规范复核 | 联网通道恢复后先复核 2025-06-18+ 修订（尤其授权/OAuth 条款与 notifications 语义）再开工 T0——沿用 forwarding Q6 未决；**v3 后权重再升：spec OAuth 框架若落地，P1 静态 Bearer 需对齐 resource server 元数据形态** |
 | Q9 | 聚合纳入粒度 | ✅ **评审已定：`mcp.servers.<id>.hub: bool`，默认启用**；`false` 仅摘出聚合面、透明转发保留（v1 `hub.servers` 白名单作废） |
-| Q10 | 凭证集中保管破例（v3） | ✅ **需求已定**：后端鉴权统一配置在 hub（`servers.<id>.auth`，仅 hub 消费），A 路径零接触语义不变；治理四件套见 §2.3/§5.8.3，AGENTS.md #1 修订登记进 T8 |
+| Q10 | 凭证集中保管破例（v3） | ✅ **需求已定**：后端鉴权统一配置在 hub（v4：**专属命名空间 `mcp.hub.credentials`**，`servers` 段无鉴权字段），A 路径零接触 + 零感知（不碰鉴权头：不注不剥，客户端头照旧透传）；治理四件套见 §2.3/§5.8.3，AGENTS.md #1 修订登记进 T8 |
 | Q11 | 客户端凭证形态（v3） | ✅ **需求已定**：hub 签发唯一 token 替代原 mcp server 鉴权头；实现取 `Authorization: Bearer`（§5.8.1）；客户端凭证**不向后端透传**（剥离+置换，§5.8.2） |
 | Q12 | token 签发机制 | 建议：**P1 静态 token 表**（env 注入、label 审计、per-token scope、fail-closed）即满足需求；P2 `POST /mcphub/token` HMAC 限时 token 列 T14——待复核 |
-| Q13 | 凭证配置形状 | 建议：`servers.<id>.auth.headers_env`（JSON env，首选）/`auth.headers`（内联兜底 600 WARN）——待复核 |
+| Q13 | 凭证配置形状 | ✅ **v4 评审已定**：`mcp.hub.credentials.<id>.{headers_env|headers}`（hub 专属命名空间；`headers_env` JSON env 首选，内联兜底 600 WARN）——`/mcp/*` 转发配置面不存在鉴权概念 |
 | Q14 | 鉴权默认姿态 | 建议：`hub.auth` 缺段 = 不鉴权（duct opt-in 传统）；但 README/deploy **强推 hub 场景开启**（聚合面即执行面）——待复核 |

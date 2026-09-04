@@ -391,7 +391,7 @@ Socket 级集成（`tests/mcp.rs` + dispatch 平移）：
 |---|---|---|
 | Q1 范围 | 遗留 HTTP+SSE 改写（B 方案）的交付节奏 | 🔄 **v3 评审变更：本期只做 A（Streamable HTTP 透明转发），B 顺延二期**（设计留档 §5.4，`transport` 字段暂缓；前轮"A+B 同期"决议作废） |
 | Q2 stdio | 不内建子进程托管；README/deploy 给出 supergateway 组合姿势 | ✅ **按推荐执行** |
-| Q3 聚合 | 确认不做单端点工具聚合（§2.4） | ✅ 按推荐执行，不做（如未来需要单独立项） |
+| Q3 聚合 | 确认不做单端点工具聚合（§2.4） | ✅ 按推荐执行，转发本身不做（后续已单独立项 → `docs/mcp-hub-design.md`） |
 | Q4 origin_policy 默认值 | `keep`（透传，与 aiproxy 无侵入哲学一致）；`strip`/`upstream` 按需显式配置 | ✅ 按推荐执行 |
 | Q5 配置形态 | 取 `mcp.servers.<id>.{url, origin_policy}` 嵌套段（`transport` 键二期随 B 启用） | ✅ **已确认**（v3 微调：本期两键） |
 | Q6 规范复核 | MCP 是否有 2025-06-18 之后的新修订影响 §2.3 结论（如 `Mcp-Param-*` 头、轮询长轮询语义） | ⏳ 联网通道恢复后复核一次（预计不改 A 方案结论，仅可能增补透传头清单） |

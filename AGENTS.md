@@ -40,7 +40,7 @@ src/
   error.rs       # OpenAI-compatible error responses
   auth.rs        # HTTP Basic auth check + base64 decode
 tests/           # aiproxy / dispatch / integration / mcp / trace_e2e integration suites
-docs/            # aiproxy-trace / deploy / mcp-forwarding / sse-tool-stream-normalization
+docs/            # aiproxy-trace / deploy / mcp-forwarding / mcp-hub / sse-tool-stream-normalization
 ```
 
 ## Core architecture
@@ -172,5 +172,7 @@ mcp 分支与 aiproxy 共用同一 `trace.jsonl`，事件 `data.branch:"mcp"` + 
 
 - `docs/aiproxy-trace.md` — event vocabulary, severity mapping, redaction contract, jq recipes.
 - `docs/sse-tool-stream-normalization.md` — the normalize_sse behavior and compressed-stream re-encode path.
+- `docs/mcp-forwarding-design.md` — the /mcp transparent forwarding design (v3 A plan, landed).
+- `docs/mcp-hub-design.md` — single-endpoint MCP aggregation gateway design (v1, not implemented).
 - `docs/deploy.md` — systemd unit, env-file credential injection, trace rotation.
 - `README.md` — user-facing usage + troubleshooting tables.

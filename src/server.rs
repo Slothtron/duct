@@ -1,4 +1,4 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -70,7 +70,11 @@ fn parse_proxy_url(line: &str) -> Result<(&str, u16)> {
         Ok((host, port))
     } else {
         // Default ports based on scheme
-        let port = if url.starts_with("https://") { 443u16 } else { 80u16 };
+        let port = if url.starts_with("https://") {
+            443u16
+        } else {
+            80u16
+        };
         Ok((host_port, port))
     }
 }
@@ -167,12 +171,15 @@ async fn handle_connection(
             let mut prelude = line.clone().into_bytes();
             prelude.push(b'\r');
             prelude.push(b'\n');
-            return crate::aiproxy::serve_conn_from_prelude(aiproxy.clone(), &prelude, stream).await;
+            return crate::aiproxy::serve_conn_from_prelude(aiproxy.clone(), &prelude, stream)
+                .await;
         }
         // 序 5：其余相对路径兜底拒绝 —— duct 不是反向代理
         tracing::debug!(path = %uri, "non-aiproxy relative path rejected");
         let _ = stream
-            .write_all(b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+            .write_all(
+                b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+            )
             .await;
         bail!("relative path requests are only supported under /aiproxy/");
     }
@@ -184,9 +191,7 @@ async fn handle_connection(
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::warn!(error = %e, "invalid CONNECT request: {line}");
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                        .await;
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                     return Err(e);
                 }
             };
@@ -210,9 +215,7 @@ async fn handle_connection(
                 Ok(pair) => pair,
                 Err(e) => {
                     tracing::warn!(error = %e, "invalid proxy request: {line}");
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n")
-                        .await;
+                    let _ = stream.write_all(b"HTTP/1.1 400 Bad Request\r\n\r\n").await;
                     return Err(e);
                 }
             };
@@ -241,9 +244,7 @@ async fn handle_connection(
                 Ok(Ok(stream)) => stream,
                 Ok(Err(e)) => {
                     tracing::error!(%addr, error = %e, "failed to connect to upstream");
-                    let _ = stream
-                        .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                        .await;
+                    let _ = stream.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
                     return Err(e.into());
                 }
                 Err(_elapsed) => {
@@ -369,19 +370,22 @@ mod tests {
 
     #[test]
     fn test_rebuild_request_line_basic() {
-        let result = rebuild_request_line("GET http://example.com/foo HTTP/1.1", "example.com", 80).unwrap();
+        let result =
+            rebuild_request_line("GET http://example.com/foo HTTP/1.1", "example.com", 80).unwrap();
         assert_eq!(result, "GET /foo HTTP/1.1\r\n");
     }
 
     #[test]
     fn test_rebuild_request_line_root() {
-        let result = rebuild_request_line("GET http://example.com/ HTTP/1.1", "example.com", 80).unwrap();
+        let result =
+            rebuild_request_line("GET http://example.com/ HTTP/1.1", "example.com", 80).unwrap();
         assert_eq!(result, "GET / HTTP/1.1\r\n");
     }
 
     #[test]
     fn test_rebuild_request_line_no_slash() {
-        let result = rebuild_request_line("GET http://example.com HTTP/1.1", "example.com", 80).unwrap();
+        let result =
+            rebuild_request_line("GET http://example.com HTTP/1.1", "example.com", 80).unwrap();
         assert_eq!(result, "GET / HTTP/1.1\r\n");
     }
 }

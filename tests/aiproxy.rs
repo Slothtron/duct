@@ -22,10 +22,8 @@ static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 /// 经真实装载路径生成配置。
 fn config_from_yaml(yaml_body: &str) -> Arc<Config> {
     let seq = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
-    let path: PathBuf = std::env::temp_dir().join(format!(
-        "duct-test-{}-{seq}.yaml",
-        std::process::id()
-    ));
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("duct-test-{}-{seq}.yaml", std::process::id()));
     std::fs::write(&path, format!("providers:\n{yaml_body}")).unwrap();
     let cfg = Config::load_explicit(&path).expect("load test config");
     std::fs::remove_file(&path).ok();
@@ -298,7 +296,10 @@ async fn post_forwards_path_method_and_body() {
         state,
         "POST",
         "/aiproxy/mock/v1/chat/completions",
-        &[("authorization", UNIQUE_HEADER_VALUE), ("content-type", "application/json")],
+        &[
+            ("authorization", UNIQUE_HEADER_VALUE),
+            ("content-type", "application/json"),
+        ],
         Some(payload.to_vec()),
     )
     .await;

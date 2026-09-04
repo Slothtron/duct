@@ -1,14 +1,18 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use std::time::Duration;
 use tokio::io::{AsyncWriteExt, copy_bidirectional};
-use tokio::net::TcpStream;/// Parse a CONNECT request line, extracting host and port.
+use tokio::net::TcpStream;
+/// Parse a CONNECT request line, extracting host and port.
 /// Expected format: `CONNECT host:port HTTP/1.1\r\n`
 pub fn parse_connect_request(line: &str) -> Result<(&str, u16)> {
     let line = line.trim_end_matches('\r').trim_end_matches('\n');
 
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 {
-        bail!("invalid CONNECT request: expected 3 parts, got {}", parts.len());
+        bail!(
+            "invalid CONNECT request: expected 3 parts, got {}",
+            parts.len()
+        );
     }
 
     let method = parts[0];
@@ -101,30 +105,24 @@ pub const UPSTREAM_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// Drops the connection if any step fails.
 pub async fn handle_connect(mut client: TcpStream, host: &str, port: u16) -> Result<()> {
     let addr = format!("{host}:{port}");
-    let mut upstream = match tokio::time::timeout(
-        UPSTREAM_CONNECT_TIMEOUT,
-        TcpStream::connect(&addr),
-    )
-    .await
-    {
-        Ok(Ok(stream)) => stream,
-        Ok(Err(e)) => {
-            tracing::error!(%addr, error = %e, "failed to connect to upstream");
-            let _ = client
-                .write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n")
-                .await;
-            return Err(e.into());
-        }
-        Err(_elapsed) => {
-            tracing::error!(%addr, "upstream connection timed out");
-            let _ = client
-                .write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
-                .await;
-            return Err(anyhow::anyhow!(
-                "upstream connection timed out after {UPSTREAM_CONNECT_TIMEOUT:?}"
-            ));
-        }
-    };
+    let mut upstream =
+        match tokio::time::timeout(UPSTREAM_CONNECT_TIMEOUT, TcpStream::connect(&addr)).await {
+            Ok(Ok(stream)) => stream,
+            Ok(Err(e)) => {
+                tracing::error!(%addr, error = %e, "failed to connect to upstream");
+                let _ = client.write_all(b"HTTP/1.1 502 Bad Gateway\r\n\r\n").await;
+                return Err(e.into());
+            }
+            Err(_elapsed) => {
+                tracing::error!(%addr, "upstream connection timed out");
+                let _ = client
+                    .write_all(b"HTTP/1.1 504 Gateway Timeout\r\n\r\n")
+                    .await;
+                return Err(anyhow::anyhow!(
+                    "upstream connection timed out after {UPSTREAM_CONNECT_TIMEOUT:?}"
+                ));
+            }
+        };
 
     if let Err(e) = client
         .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")

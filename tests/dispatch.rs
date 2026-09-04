@@ -4,8 +4,8 @@
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
@@ -16,10 +16,8 @@ static TMP_SEQ: AtomicUsize = AtomicUsize::new(0);
 
 fn config_from_yaml(yaml_body: &str) -> Arc<Config> {
     let seq = TMP_SEQ.fetch_add(1, Ordering::SeqCst);
-    let path: PathBuf = std::env::temp_dir().join(format!(
-        "duct-dispatch-{}-{seq}.yaml",
-        std::process::id()
-    ));
+    let path: PathBuf =
+        std::env::temp_dir().join(format!("duct-dispatch-{}-{seq}.yaml", std::process::id()));
     std::fs::write(&path, format!("providers:\n{yaml_body}")).unwrap();
     let cfg = Config::load_explicit(&path).unwrap();
     std::fs::remove_file(&path).ok();
@@ -33,7 +31,9 @@ async fn spawn_echo_upstream() -> SocketAddr {
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
         loop {
-            let Ok((mut sock, _)) = listener.accept().await else { break };
+            let Ok((mut sock, _)) = listener.accept().await else {
+                break;
+            };
             tokio::spawn(async move {
                 // 读到头部结束
                 let mut buf: Vec<u8> = Vec::new();
@@ -60,14 +60,11 @@ async fn spawn_echo_upstream() -> SocketAddr {
                             Ok(_) => buf.push(byte[0]),
                         }
                     }
-                } else if let Some(cl) = head
-                    .lines()
-                    .find_map(|l| {
-                        let (k, v) = l.split_once(':')?;
-                        k.eq_ignore_ascii_case("content-length")
-                            .then(|| v.trim().parse::<usize>().ok())?
-                    })
-                {
+                } else if let Some(cl) = head.lines().find_map(|l| {
+                    let (k, v) = l.split_once(':')?;
+                    k.eq_ignore_ascii_case("content-length")
+                        .then(|| v.trim().parse::<usize>().ok())?
+                }) {
                     let consumed = buf.len();
                     let head_end = head.find("\r\n\r\n").map(|i| i + 4).unwrap_or(consumed);
                     let already = consumed.saturating_sub(head_end);

@@ -1,6 +1,6 @@
+use duct::auth::AuthConfig;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpListener;
-use duct::auth::AuthConfig;
 
 /// Start an HTTP echo server that reads a request and sends back a canned response.
 /// Returns the port it's listening on.
@@ -29,9 +29,7 @@ async fn start_http_echo_server() -> u16 {
                 let path = *parts.get(1).unwrap_or(&"/");
 
                 // Send canned HTTP response
-                let body = format!(
-                    "{{ \"method\": \"{method}\", \"path\": \"{path}\" }}"
-                );
+                let body = format!("{{ \"method\": \"{method}\", \"path\": \"{path}\" }}");
                 let response = format!(
                     "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{}",
                     body.len(),
@@ -55,7 +53,9 @@ async fn start_duct_with_auth(auth: Option<AuthConfig>) -> std::net::SocketAddr 
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(async move {
-        duct::server::run_from_listener(listener, auth).await.unwrap();
+        duct::server::run_from_listener(listener, auth)
+            .await
+            .unwrap();
     });
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     addr
@@ -388,10 +388,7 @@ async fn test_e2e_connect_without_auth_returns_407() {
     let mut buf = [0u8; 1024];
     let n = conn.read(&mut buf).await.unwrap();
     let response = String::from_utf8_lossy(&buf[..n]);
-    assert!(
-        response.contains("407"),
-        "expected 407, got: {response}"
-    );
+    assert!(response.contains("407"), "expected 407, got: {response}");
     assert!(
         response.contains("Proxy Authentication Required"),
         "expected Proxy Authentication Required, got: {response}"
@@ -424,10 +421,7 @@ async fn test_e2e_connect_wrong_password_returns_407() {
     let mut buf = [0u8; 1024];
     let n = conn.read(&mut buf).await.unwrap();
     let response = String::from_utf8_lossy(&buf[..n]);
-    assert!(
-        response.contains("407"),
-        "expected 407, got: {response}"
-    );
+    assert!(response.contains("407"), "expected 407, got: {response}");
 }
 
 #[tokio::test]
@@ -481,16 +475,13 @@ async fn test_e2e_http_proxy_without_auth_returns_407() {
     let mut buf = [0u8; 1024];
     let n = conn.read(&mut buf).await.unwrap();
     let response = String::from_utf8_lossy(&buf[..n]);
-    assert!(
-        response.contains("407"),
-        "expected 407, got: {response}"
-    );
+    assert!(response.contains("407"), "expected 407, got: {response}");
 }
 
 #[tokio::test]
 async fn test_e2e_auth_disabled_backward_compat() {
     // Without auth, existing behavior should still work
-    let duct_addr = start_duct().await;  // no auth
+    let duct_addr = start_duct().await; // no auth
     let upstream_port = start_http_echo_server().await;
 
     let mut conn = tokio::net::TcpStream::connect(duct_addr).await.unwrap();

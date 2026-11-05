@@ -1,13 +1,9 @@
 use anyhow::{Context, Result, bail};
-use std::sync::Arc;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::{TcpListener, TcpStream};
 
-use crate::aiproxy::AppState;
 use crate::auth::{self, AuthConfig};
-use crate::config::Config;
 use crate::connect;
-use crate::mcp::McpState;
 
 /// Maximum length of the request line before returning 414.
 const MAX_REQUEST_LINE_BYTES: usize = 8192;
@@ -24,37 +20,13 @@ pub async fn run(addr: impl tokio::net::ToSocketAddrs, auth: Option<AuthConfig>)
 /// Run the duct proxy server from an already-bound listener.
 /// Useful for tests that bind to a random port.
 pub async fn run_from_listener(listener: TcpListener, auth: Option<AuthConfig>) -> Result<()> {
-    let state = AppState::new(Default::default(), 16 * 1024 * 1024)?;
-    run_with_aiproxy_from_listener(listener, auth, state).await
-}
-
-/// 完整形态：显式传入 aiproxy 状态（空配置 ⇒ `/aiproxy/*` 回 404，传统代理不受影响）。
-pub async fn run_with_aiproxy_from_listener(
-    listener: TcpListener,
-    auth: Option<AuthConfig>,
-    aiproxy_state: AppState,
-) -> Result<()> {
-    // 兼容旧入口：附属一个空 mcp state（无 server，`/mcp/*` 全 404）。
-    let mcp_state = McpState::new(Arc::new(Config::default()), aiproxy_state.max_body)?;
-    run_with_states_from_listener(listener, auth, aiproxy_state, mcp_state).await
-}
-
-/// 双 state 完整形态：aiproxy + mcp 各自独立装配，共享同一 `Arc<Config>`。
-pub async fn run_with_states_from_listener(
-    listener: TcpListener,
-    auth: Option<AuthConfig>,
-    aiproxy: AppState,
-    mcp: McpState,
-) -> Result<()> {
     tracing::info!("duct listening on {}", listener.local_addr()?);
     loop {
         let (stream, peer_addr) = listener.accept().await?;
         tracing::debug!(%peer_addr, "new connection");
         let auth = auth.clone();
-        let aiproxy = aiproxy.clone();
-        let mcp = mcp.clone();
         tokio::spawn(async move {
-            if let Err(e) = handle_connection(stream, auth.as_ref(), &aiproxy, &mcp).await {
+            if let Err(e) = handle_connection(stream, auth.as_ref()).await {
                 tracing::warn!(%peer_addr, error = %e, "connection error");
             }
         });
@@ -69,28 +41,19 @@ fn parse_proxy_url(line: &str) -> Result<(&str, u16)> {
         bail!("invalid request line");
     }
     let url = parts[1];
-    // URL should be absolute: http://host:port/path or https://host:port/path
     let without_scheme = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
         .context("unsupported URL scheme in proxy request")?;
-
-    // Split host:port from path
     let (host_port, _path) = without_scheme
         .split_once('/')
         .unwrap_or((without_scheme, ""));
 
-    // Now check for port
     if let Some((host, port_str)) = host_port.rsplit_once(':') {
         let port: u16 = port_str.parse().context("invalid port number")?;
         Ok((host, port))
     } else {
-        // Default ports based on scheme
-        let port = if url.starts_with("https://") {
-            443u16
-        } else {
-            80u16
-        };
+        let port = if url.starts_with("https://") { 443 } else { 80 };
         Ok((host_port, port))
     }
 }
@@ -132,7 +95,6 @@ async fn read_headers(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8
             return Ok(buf);
         }
         buf.push(byte[0]);
-        // Shift window and check for \r\n\r\n
         window[0] = window[1];
         window[1] = window[2];
         window[2] = window[3];
@@ -145,73 +107,35 @@ async fn read_headers(stream: &mut TcpStream, max_bytes: usize) -> Result<Vec<u8
     Ok(buf)
 }
 
-async fn handle_connection(
-    mut stream: TcpStream,
-    auth: Option<&AuthConfig>,
-    aiproxy: &AppState,
-    mcp: &McpState,
-) -> Result<()> {
-    // Read the request line
+async fn handle_connection(mut stream: TcpStream, auth: Option<&AuthConfig>) -> Result<()> {
     let line = read_line(&mut stream, MAX_REQUEST_LINE_BYTES)
         .await
         .context("failed to read request line")?;
-
     if line.is_empty() {
         return Ok(());
     }
 
-    // Determine method
     let method = line.split_whitespace().next().unwrap_or("");
-
-    // ── 分流判定（设计文档 §5.1 六分支）─────────────────────────────
-    // origin-form（相对路径）请求先行判定：/healthz 探活、/aiproxy/* 反向代理、
-    // /mcp/* MCP 转发、其余一律 400。CONNECT 与 absolute-form 不受影响，Basic 认证
-    // 仍仅作用于这两条既有分支（P6：认证禁止上提至共享分流层）。
-    let origin_uri = (method != "CONNECT")
-        .then(|| line.split_whitespace().nth(1))
-        .flatten()
-        .filter(|uri| uri.starts_with('/') && !uri.contains("://"));
-    if let Some(uri) = origin_uri {
-        // 序 4：探活端点 —— GET 全等命中，分流层直接应答，独立于配置状态
+    if method != "CONNECT" {
+        let uri = line.split_whitespace().nth(1).unwrap_or("");
         if method == "GET" && uri == "/healthz" {
-            tracing::debug!("healthz probe");
             let _ = stream
                 .write_all(b"HTTP/1.1 200 OK\r\ncontent-type: text/plain\r\ncontent-length: 2\r\nconnection: close\r\n\r\nok")
                 .await;
             return Ok(());
         }
-        // 序 1：aiproxy —— 路径段 1 == aiproxy 且其后仍有 provider 段
-        let segments: Vec<&str> = uri.split('/').collect();
-        // "/aiproxy/x/..." → ["", "aiproxy", "x", ...]
-        if segments.len() >= 3 && segments[1] == "aiproxy" && !segments[2].is_empty() {
-            tracing::debug!(path = %uri, "dispatch to aiproxy");
-            let mut prelude = line.clone().into_bytes();
-            prelude.push(b'\r');
-            prelude.push(b'\n');
-            return crate::aiproxy::serve_conn_from_prelude(aiproxy.clone(), &prelude, stream)
+        if uri.starts_with('/') && !uri.contains("://") {
+            let _ = stream
+                .write_all(
+                    b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
+                )
                 .await;
+            bail!("relative path requests are not supported by the forward proxy");
         }
-        // 序 2：mcp —— 路径段 1 == mcp（含裸 /mcp，由 mcp router 回 404 列表）
-        if segments.len() >= 2 && segments[1] == "mcp" {
-            tracing::debug!(path = %uri, "dispatch to mcp");
-            let mut prelude = line.clone().into_bytes();
-            prelude.push(b'\r');
-            prelude.push(b'\n');
-            return crate::mcp::serve_conn_from_prelude(mcp.clone(), &prelude, stream).await;
-        }
-        // 序 5：其余相对路径兜底拒绝 —— duct 不是反向代理
-        tracing::debug!(path = %uri, "non-aiproxy non-mcp relative path rejected");
-        let _ = stream
-            .write_all(
-                b"HTTP/1.1 400 Bad Request\r\ncontent-length: 0\r\nconnection: close\r\n\r\n",
-            )
-            .await;
-        bail!("relative path requests are only supported under /aiproxy/ or /mcp/");
     }
 
     match method {
         "CONNECT" => {
-            // ── CONNECT tunnel ──
             let (host, port) = match connect::parse_connect_request(&line) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -220,22 +144,16 @@ async fn handle_connection(
                     return Err(e);
                 }
             };
-
-            // Read headers for potential auth check
             let headers = read_headers(&mut stream, MAX_HTTP_REQUEST_BYTES).await?;
-
-            // Check authentication if enabled
             if auth.is_some_and(|auth_config| !check_auth(auth_config, &headers)) {
                 let _ = stream
                     .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"duct\"\r\n\r\n")
                     .await;
                 bail!("authentication failed");
             }
-
             connect::handle_connect(stream, host, port).await
         }
         _ => {
-            // ── HTTP forward proxy ──
             let (host, port) = match parse_proxy_url(&line) {
                 Ok(pair) => pair,
                 Err(e) => {
@@ -244,21 +162,14 @@ async fn handle_connection(
                     return Err(e);
                 }
             };
-
-            // Read the headers
             let headers = read_headers(&mut stream, MAX_HTTP_REQUEST_BYTES).await?;
-
-            // Check authentication if enabled
             if auth.is_some_and(|auth_config| !check_auth(auth_config, &headers)) {
                 let _ = stream
                     .write_all(b"HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"duct\"\r\n\r\n")
                     .await;
                 bail!("authentication failed");
             }
-
-            // Build the full request to forward (rewrite request line to relative URL)
-            let request_line = rebuild_request_line(&line, host, port)?;
-
+            let request_line = rebuild_request_line(&line)?;
             let addr = format!("{host}:{port}");
             let mut upstream = match tokio::time::timeout(
                 connect::UPSTREAM_CONNECT_TIMEOUT,
@@ -285,24 +196,13 @@ async fn handle_connection(
             };
 
             tracing::info!(%addr, method, "forwarding HTTP request");
-
-            // Forward the request
             upstream.write_all(request_line.as_bytes()).await?;
             upstream.write_all(&headers).await?;
-
-            // Enable TCP_NODELAY
             let _ = stream.set_nodelay(true);
             let _ = upstream.set_nodelay(true);
-
-            // Bidirectional copy
             match tokio::io::copy_bidirectional(&mut stream, &mut upstream).await {
                 Ok((to_upstream, to_client)) => {
-                    tracing::info!(
-                        %addr,
-                        to_client_bytes = to_client,
-                        to_upstream_bytes = to_upstream,
-                        "HTTP proxy request complete"
-                    );
+                    tracing::info!(%addr, to_client_bytes = to_client, to_upstream_bytes = to_upstream, "HTTP proxy request complete");
                     Ok(())
                 }
                 Err(e) => {
@@ -317,9 +217,7 @@ async fn handle_connection(
 /// Check authentication against raw HTTP headers.
 /// Returns true if auth passes or if not required.
 fn check_auth(config: &AuthConfig, headers: &[u8]) -> bool {
-    // Look for Proxy-Authorization header in raw bytes (case-insensitive)
     let header_str = String::from_utf8_lossy(headers);
-
     for line in header_str.lines() {
         if !line.to_lowercase().starts_with("proxy-authorization:") {
             continue;
@@ -331,13 +229,12 @@ fn check_auth(config: &AuthConfig, headers: &[u8]) -> bool {
             return auth::check(config, &user, &pass);
         }
     }
-
     false
 }
 
 /// Rebuild the request line from an absolute URL to a relative one.
 /// `GET http://dmc.kso.net/path HTTP/1.1` → `GET /path HTTP/1.1`
-fn rebuild_request_line(line: &str, _host: &str, _port: u16) -> Result<String> {
+fn rebuild_request_line(line: &str) -> Result<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 {
         bail!("invalid request line");
@@ -345,15 +242,11 @@ fn rebuild_request_line(line: &str, _host: &str, _port: u16) -> Result<String> {
     let method = parts[0];
     let url = parts[1];
     let version = parts[2];
-
-    // Extract the path from the absolute URL
     let path = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
         .map(|rest| rest.find('/').map(|i| &rest[i..]).unwrap_or("/"))
         .unwrap_or("/");
-
-    // Add query string if present in original URL
     let full_path = if let Some(qi) = url.find('?') {
         let query = &url[qi..];
         if !path.contains('?') {
@@ -364,7 +257,6 @@ fn rebuild_request_line(line: &str, _host: &str, _port: u16) -> Result<String> {
     } else {
         path.to_string()
     };
-
     Ok(format!("{method} {full_path} {version}\r\n"))
 }
 
@@ -395,22 +287,25 @@ mod tests {
 
     #[test]
     fn test_rebuild_request_line_basic() {
-        let result =
-            rebuild_request_line("GET http://example.com/foo HTTP/1.1", "example.com", 80).unwrap();
-        assert_eq!(result, "GET /foo HTTP/1.1\r\n");
+        assert_eq!(
+            rebuild_request_line("GET http://example.com/foo HTTP/1.1").unwrap(),
+            "GET /foo HTTP/1.1\r\n"
+        );
     }
 
     #[test]
     fn test_rebuild_request_line_root() {
-        let result =
-            rebuild_request_line("GET http://example.com/ HTTP/1.1", "example.com", 80).unwrap();
-        assert_eq!(result, "GET / HTTP/1.1\r\n");
+        assert_eq!(
+            rebuild_request_line("GET http://example.com/ HTTP/1.1").unwrap(),
+            "GET / HTTP/1.1\r\n"
+        );
     }
 
     #[test]
     fn test_rebuild_request_line_no_slash() {
-        let result =
-            rebuild_request_line("GET http://example.com HTTP/1.1", "example.com", 80).unwrap();
-        assert_eq!(result, "GET / HTTP/1.1\r\n");
+        assert_eq!(
+            rebuild_request_line("GET http://example.com HTTP/1.1").unwrap(),
+            "GET / HTTP/1.1\r\n"
+        );
     }
 }

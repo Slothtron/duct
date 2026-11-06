@@ -45,9 +45,9 @@ mod tests {
 
     #[test]
     fn test_parse_connect_valid() {
-        let (host, port) = parse_connect_request("CONNECT dmc.kso.net:443 HTTP/1.1\r\n")
+        let (host, port) = parse_connect_request("CONNECT example.com:443 HTTP/1.1\r\n")
             .expect("should parse valid CONNECT");
-        assert_eq!(host, "dmc.kso.net");
+        assert_eq!(host, "example.com");
         assert_eq!(port, 443);
     }
 

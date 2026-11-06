@@ -1,3 +1,4 @@
 /target/
 package-lock.json
 .pi/
+.agents/

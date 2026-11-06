@@ -34,7 +34,7 @@ pub async fn run_from_listener(listener: TcpListener, auth: Option<AuthConfig>) 
 }
 
 /// Parse the absolute URL from an HTTP forward proxy request line.
-/// E.g. `GET http://dmc.kso.net/path HTTP/1.1` → host: dmc.kso.net, port: 80
+/// E.g. `GET http://example.com/path HTTP/1.1` → host: example.com, port: 80
 fn parse_proxy_url(line: &str) -> Result<(&str, u16)> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 2 {
@@ -233,7 +233,7 @@ fn check_auth(config: &AuthConfig, headers: &[u8]) -> bool {
 }
 
 /// Rebuild the request line from an absolute URL to a relative one.
-/// `GET http://dmc.kso.net/path HTTP/1.1` → `GET /path HTTP/1.1`
+/// `GET http://example.com/path HTTP/1.1` → `GET /path HTTP/1.1`
 fn rebuild_request_line(line: &str) -> Result<String> {
     let parts: Vec<&str> = line.split_whitespace().collect();
     if parts.len() < 3 {
@@ -266,15 +266,15 @@ mod tests {
 
     #[test]
     fn test_parse_proxy_url_http() {
-        let (host, port) = parse_proxy_url("GET http://dmc.kso.net/ HTTP/1.1").unwrap();
-        assert_eq!(host, "dmc.kso.net");
+        let (host, port) = parse_proxy_url("GET http://example.com/ HTTP/1.1").unwrap();
+        assert_eq!(host, "example.com");
         assert_eq!(port, 80);
     }
 
     #[test]
     fn test_parse_proxy_url_https() {
-        let (host, port) = parse_proxy_url("GET https://dmc.kso.net:8443/path HTTP/1.1").unwrap();
-        assert_eq!(host, "dmc.kso.net");
+        let (host, port) = parse_proxy_url("GET https://example.com:8443/path HTTP/1.1").unwrap();
+        assert_eq!(host, "example.com");
         assert_eq!(port, 8443);
     }
 
